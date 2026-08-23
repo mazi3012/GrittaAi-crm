@@ -13,8 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Copy dependency definition and install Python packages
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements-bot.txt ./requirements-bot.txt
+RUN pip install --no-cache-dir -r requirements-bot.txt
 
 # Copy application code
 COPY . .
