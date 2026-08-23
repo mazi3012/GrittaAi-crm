@@ -1,0 +1,29 @@
+# --- Secrets & Local Environments ---
+.env
+.env.local
+.env.*.local
+
+# --- Python Caches & Virtual Environments ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# --- Local Databases & Logs ---
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# --- Deployment & IDE Noise ---
+.vercel
+.vscode/
+.idea/
+.DS_Store
+*.swp

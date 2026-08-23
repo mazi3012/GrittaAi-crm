@@ -1,0 +1,12 @@
+# Gretta AI — runtime dependencies (pinned, minimal)
+# NOTE: sentence-transformers/torch were removed on purpose — they were only
+# used by the deleted build_db.py RAG script and bloated the venv to ~6.3 GB.
+pyTelegramBotAPI==4.36.1
+paddleocr==3.7.0
+paddlepaddle==3.3.1
+fastapi==0.141.1
+uvicorn==0.52.4
+requests==2.34.2
+numpy==2.3.5
+pillow==12.3.0
+python-dotenv==1.2.3

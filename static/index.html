@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Gretta AI — CRM Command Center</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E⚡%3C/text%3E%3C/svg%3E"/>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet"/>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="/static/styles.css"/>
+</head>
+<body>
+<div id="aurora"></div>
+
+<div class="shell">
+
+  <!-- ══════════ SIDEBAR ══════════ -->
+  <aside id="sidebar">
+    <a href="/" class="brand-link">
+      <span class="brand-icon">⚡</span>
+      <span class="brand-text">
+        <span class="brand-title">Gretta CRM</span>
+        <span class="brand-subtitle">COMMAND CENTER</span>
+      </span>
+    </a>
+
+    <nav class="nav-group">
+      <button class="nav-btn active" data-view="overview"><span class="ico">📊</span> Overview</button>
+      <button class="nav-btn" data-view="board"><span class="ico">🗂</span> Pipeline Board</button>
+      <button class="nav-btn" data-view="leads"><span class="ico">📋</span> All Leads</button>
+    </nav>
+
+    <div class="sidebar-footer">
+      <div class="health-card glass">
+        <div class="health-label">Pipeline Health</div>
+        <div class="bar-mini"><div id="healthBar" style="width:0%"></div></div>
+        <div class="health-stat"><b id="healthPct">0%</b> of leads past “New”</div>
+      </div>
+      <div class="sidebar-status-row">
+        <span class="shortcut-hint">Press <kbd class="key">⌘/Ctrl</kbd>+<kbd class="key">K</kbd></span>
+        <span id="botStatus" class="status-indicator">● Bot live</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ══════════ MAIN COLUMN ══════════ -->
+  <div class="main-column">
+
+    <!-- TOPBAR -->
+    <header class="topbar glass">
+      <button id="hamburger" class="icon-btn hamburger-btn">☰</button>
+      <div class="search-wrap">
+        <span class="s-ico">🔎</span>
+        <input id="q" class="top-search" placeholder="Search leads by name, owner, summary…" autocomplete="off"/>
+      </div>
+      <div id="liveWrap" class="live-pill">
+        <span class="live-dot" id="liveDot"></span>
+        <span id="liveLbl" class="live-label">Live</span>
+      </div>
+      <div class="topbar-actions">
+        <button id="pauseBtn" class="icon-btn" title="Pause live polling">⏸ Pause</button>
+        <button id="csvBtn" class="icon-btn" title="Export filtered leads as CSV">⤓ CSV</button>
+        <button id="themeBtn" class="icon-btn theme-toggle-btn" title="Switch mode">☀️ Light</button>
+        <button id="refreshBtn" class="icon-btn primary" title="Reload now (R)">⟳ Refresh</button>
+      </div>
+    </header>
+
+    <!-- VIEWS -->
+    <main class="view-container">
+      <section id="view-overview" class="view"></section>
+      <section id="view-board" class="view" style="display:none;"></section>
+      <section id="view-leads" class="view" style="display:none;"></section>
+    </main>
+  </div>
+</div>
+
+<!-- ══════════ OVERLAYS ══════════ -->
+<div id="backdrop"></div>
+<aside id="drawer" aria-label="Lead details"><div id="drawerBody"></div></aside>
+
+<div id="cmdk">
+  <div class="cmdk-box">
+    <input id="cmdkInput" class="cmdk-input" placeholder="Jump to a lead or view…" autocomplete="off"/>
+    <div id="cmdkList" class="cmdk-list"></div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
