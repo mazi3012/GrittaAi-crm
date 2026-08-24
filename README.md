@@ -55,11 +55,27 @@ uvicorn dashboard:app --host 0.0.0.0 --port 8000
 4. In Space Settings -> **Variables and secrets**, add:
    - `TELEGRAM_TOKEN` = `your_telegram_bot_token`
    - `OPENROUTER_API_KEY` = `your_openrouter_api_key`
-   - `MODEL` = `nvidia/nemotron-3-ultra-550b-a55b:free` (optional)
+   - `MODEL` = `stealth/ox-alpha` (optional)
    - `DASHBOARD_URL` = `https://your-vercel-dashboard.vercel.app` (optional)
 5. Hugging Face will automatically build the container using the provided `Dockerfile` and start the bot with a built-in health check on port `7860`.
 
-### 2. Host FastAPI Dashboard on Vercel (Free)
+### 2. Host Telegram Bot on Render (Alternative to HF Spaces)
+
+1. Push this repository to GitHub (`mazi3012/GrittaAi-crm`).
+2. On [Render](https://dashboard.render.com), click **New + → Blueprint** and select the repo — Render detects `render.yaml`.
+3. When prompted, fill in the secret variables:
+   - `TELEGRAM_TOKEN` = your telegram bot token
+   - `OPENROUTER_API_KEY` = your OpenRouter API key
+   - `DASHBOARD_URL` = your live Vercel dashboard URL (e.g. `https://your-app.vercel.app`)
+4. Deploy! The bot runs as a Docker web service; the health endpoint (`/`) responds on Render's assigned `$PORT`.
+
+> ⚠️ **Render free tier caveat:** free web services sleep after ~15 minutes without inbound HTTP traffic. A long-polling bot receives no inbound traffic, so keep it awake with a free uptime pinger (e.g. [UptimeRobot](https://uptimerobot.com)) hitting the Render URL every 10 minutes, or upgrade to the paid Starter plan. While asleep, Telegram queues updates and delivers them once the bot wakes up.
+
+> 💡 **Shared database:** set `DATABASE_URL` (Neon Postgres) in **both** the Render bot service and the Vercel dashboard project so leads created in Telegram appear live on the dashboard. Without it, each service silently falls back to its own throwaway SQLite file (`crm.db` locally, ephemeral on Render/Vercel).
+
+---
+
+### 3. Host FastAPI Dashboard on Vercel (Free)
 
 1. Import your repository (`mazi3012/GrittaAi-crm.git`) into [Vercel](https://vercel.com/new).
 2. Vercel automatically detects `vercel.json` and configures the `@vercel/python` builder for `dashboard.py`.
@@ -73,11 +89,12 @@ uvicorn dashboard:app --host 0.0.0.0 --port 8000
 
 | File | Purpose |
 |---|---|
-| `bot.py` | Telegram bot: OCR → LLM analysis → interactive inline menus + HF health server |
+| `bot.py` | Telegram bot: Vision AI analysis → interactive inline menus + HF health server |
 | `dashboard.py` | FastAPI web dashboard serving static SPA and REST endpoints |
 | `db.py` | Shared SQLite data layer with WAL mode support |
 | `static/` | Next-Gen SPA dashboard (HTML, CSS, JS with Obsidian/Slate theme support) |
-| `Dockerfile` | Docker configuration for Hugging Face Spaces deployment |
+| `Dockerfile` | Docker configuration for Hugging Face Spaces / Render deployment |
+| `render.yaml` | Render Blueprint for one-click Telegram bot deployment |
 | `vercel.json` | Serverless configuration for Vercel deployment |
 | `knowledge.txt` | Gretta's sales persona and prompt rules |
 
@@ -89,9 +106,11 @@ uvicorn dashboard:app --host 0.0.0.0 --port 8000
 |---|---|---|
 | `TELEGRAM_TOKEN` | Bot token from @BotFather (**Required**) | — |
 | `OPENROUTER_API_KEY` | OpenRouter API Key (**Required**) | — |
-| `MODEL` | OpenRouter Model ID | `nvidia/nemotron-3-ultra-550b-a55b:free` |
+| `MODEL` | OpenRouter Model ID | `stealth/ox-alpha` |
+| `VISION_MODEL` | OpenRouter Vision Model ID | `stealth/ox-alpha` |
 | `DASHBOARD_URL` | Public HTTPS URL of the Vercel dashboard | — |
-| `DB_PATH` | Path to SQLite database | `crm.db` |
+| `DATABASE_URL` | Neon Postgres connection string — shared DB for Render + Vercel; omit for local SQLite | — |
+| `DB_PATH` | Path to SQLite database (used only when `DATABASE_URL` is unset) | `crm.db` |
 | `PORT` | Health server / web port | `7860` (HF) / `8000` (Local) |
 
 > ⚠️ Never commit `.env` to version control. Keep secrets in your environment settings on Hugging Face and Vercel.

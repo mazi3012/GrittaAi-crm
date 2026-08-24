@@ -1,15 +1,32 @@
-"""Shared SQLite data layer for Gretta AI.
+"""Shared data layer for Gretta AI.
 
 Used by BOTH bot.py and dashboard.py so the schema lives in exactly one
-place. The database runs in WAL mode so the bot can write while the
-dashboard reads without locking errors.
+place.
+
+Engines:
+- DATABASE_URL set -> Neon/Postgres (shared cloud DB: bot on Render +
+  dashboard on Vercel see the same leads).
+- DATABASE_URL unset -> local SQLite file (offline dev fallback), WAL mode
+  so the bot can write while the dashboard reads without locking errors.
+
+Both drivers expose the same cursor surface used here (execute /
+fetchone / fetchall / rowcount / commit); only the placeholder style
+differs (%s vs ?), handled by _PH.
 """
 
 import os
 import sqlite3
 import threading
 
-DB_NAME = os.getenv("DB_PATH", "crm.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+USE_PG = bool(DATABASE_URL)
+
+DB_NAME = os.getenv("DB_PATH", "crm.db")  # SQLite-only (ignored on Postgres)
+
+_PH = "%s" if USE_PG else "?"  # query placeholder per engine
+
+if USE_PG:
+    import psycopg  # noqa: F401  (import early so missing driver fails fast)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS leads (
@@ -29,6 +46,8 @@ _initialized = False
 
 
 def _connect():
+    if USE_PG:
+        return psycopg.connect(DATABASE_URL, connect_timeout=15)
     db_path = os.getenv("DB_PATH", DB_NAME)
     db_dir = os.path.dirname(db_path)
     if db_dir and not os.path.exists(db_dir):
@@ -38,6 +57,16 @@ def _connect():
     conn.execute("PRAGMA busy_timeout=15000")
     return conn
 
+
+def _with_ts(row):
+    """Normalize last_updated (index 7) to 'YYYY-MM-DD HH:MM:SS' strings.
+
+    Postgres returns datetime objects; SQLite returns strings. The SPA
+    sorts/displays via Date.parse(), so keep the wire format identical.
+    """
+    if row is not None and hasattr(row[7], "strftime"):
+        row = row[:7] + (row[7].strftime("%Y-%m-%d %H:%M:%S"),)
+    return row
 
 
 def init_db():
@@ -71,10 +100,10 @@ def get_lead(username):
         cur = conn.execute(
             "SELECT username, claimed_by, status, lead_score, platform, "
             "next_steps, conversation_summary, last_updated "
-            "FROM leads WHERE LOWER(username) = ?",
+            f"FROM leads WHERE LOWER(username) = {_PH}",
             (normalize_username(username),),
         )
-        return cur.fetchone()
+        return _with_ts(cur.fetchone())
     finally:
         conn.close()
 
@@ -99,7 +128,7 @@ def save_lead(username, claimed_by=None, status=None, lead_score="UNKNOWN",
         with _write_lock:
             cur = conn.execute(
                 "SELECT claimed_by, status, lead_score, platform, next_steps,"
-                " conversation_summary FROM leads WHERE LOWER(username) = ?",
+                " conversation_summary FROM leads WHERE LOWER(username) = " + _PH,
                 (username,),
             )
             existing = cur.fetchone()
@@ -111,7 +140,7 @@ def save_lead(username, claimed_by=None, status=None, lead_score="UNKNOWN",
                     INSERT INTO leads
                         (username, claimed_by, status, lead_score, platform,
                          next_steps, conversation_summary, last_updated)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                     """,
                     (
                         username,
@@ -149,14 +178,14 @@ def save_lead(username, claimed_by=None, status=None, lead_score="UNKNOWN",
                 conn.execute(
                     """
                     UPDATE leads
-                       SET claimed_by = ?,
-                           status = ?,
-                           lead_score = ?,
-                           platform = ?,
-                           next_steps = ?,
-                           conversation_summary = ?,
+                       SET claimed_by = %s,
+                           status = %s,
+                           lead_score = %s,
+                           platform = %s,
+                           next_steps = %s,
+                           conversation_summary = %s,
                            last_updated = CURRENT_TIMESTAMP
-                     WHERE LOWER(username) = ?
+                     WHERE LOWER(username) = %s
                     """,
                     (new_owner, new_status, new_score, new_platform,
                      new_next, new_summary, username),
@@ -176,7 +205,7 @@ def all_leads():
             "next_steps, conversation_summary, last_updated "
             "FROM leads ORDER BY last_updated DESC"
         )
-        return cur.fetchall()
+        return [_with_ts(r) for r in cur.fetchall()]
     finally:
         conn.close()
 
@@ -189,11 +218,11 @@ def leads_for_owner(owner):
         cur = conn.execute(
             "SELECT username, claimed_by, status, lead_score, platform, "
             "next_steps, conversation_summary, last_updated "
-            "FROM leads WHERE LOWER(claimed_by) = LOWER(?) "
+            f"FROM leads WHERE LOWER(claimed_by) = LOWER({_PH}) "
             "ORDER BY last_updated DESC",
             ((owner or "").strip(),),
         )
-        return cur.fetchall()
+        return [_with_ts(r) for r in cur.fetchall()]
     finally:
         conn.close()
 
@@ -218,8 +247,9 @@ def assign_owner(username, owner):
     try:
         with _write_lock:
             cur = conn.execute(
-                "UPDATE leads SET claimed_by = ?, last_updated = CURRENT_TIMESTAMP "
-                "WHERE LOWER(username) = ?",
+                "UPDATE leads SET claimed_by = " + _PH +
+                ", last_updated = CURRENT_TIMESTAMP "
+                "WHERE LOWER(username) = " + _PH,
                 (owner, username),
             )
             conn.commit()
@@ -274,26 +304,26 @@ def update_lead(username, claimed_by=None, status=None, lead_score=None,
     sets, vals = [], []
 
     if claimed_by is not None:
-        sets.append("claimed_by = ?")
+        sets.append(f"claimed_by = {_PH}")
         vals.append(claimed_by.strip() or None)
     if status is not None:
         if status not in VALID_STAGES:
             return False
-        sets.append("status = ?")
+        sets.append(f"status = {_PH}")
         vals.append(status)
     if lead_score is not None:
         if lead_score not in VALID_SCORES:
             return False
-        sets.append("lead_score = ?")
+        sets.append(f"lead_score = {_PH}")
         vals.append(lead_score)
     if platform is not None:
-        sets.append("platform = ?")
+        sets.append(f"platform = {_PH}")
         vals.append(platform.strip() or "Instagram")
     if next_steps is not None:
-        sets.append("next_steps = ?")
+        sets.append(f"next_steps = {_PH}")
         vals.append(next_steps.strip() or "Review lead details")
     if summary is not None:
-        sets.append("conversation_summary = ?")
+        sets.append(f"conversation_summary = {_PH}")
         vals.append(summary.strip() or None)
 
     if not sets:
@@ -303,7 +333,7 @@ def update_lead(username, claimed_by=None, status=None, lead_score=None,
         with _write_lock:
             cur = conn.execute(
                 f"UPDATE leads SET {', '.join(sets)}, last_updated = CURRENT_TIMESTAMP "
-                "WHERE LOWER(username) = ?",
+                "WHERE LOWER(username) = " + _PH,
                 (*vals, username),
             )
             conn.commit()
@@ -322,7 +352,7 @@ def delete_lead(username):
     try:
         with _write_lock:
             cur = conn.execute(
-                "DELETE FROM leads WHERE LOWER(username) = ?", (username,)
+                "DELETE FROM leads WHERE LOWER(username) = " + _PH, (username,)
             )
             conn.commit()
             return cur.rowcount > 0
@@ -345,8 +375,9 @@ def set_lead_stage(username, stage):
     try:
         with _write_lock:
             cur = conn.execute(
-                "UPDATE leads SET status = ?, last_updated = CURRENT_TIMESTAMP "
-                "WHERE LOWER(username) = ?",
+                "UPDATE leads SET status = " + _PH +
+                ", last_updated = CURRENT_TIMESTAMP "
+                "WHERE LOWER(username) = " + _PH,
                 (stage, username),
             )
             conn.commit()

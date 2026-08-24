@@ -1,0 +1,43 @@
+# Gretta AI — Render Blueprint (Telegram Bot)
+# Docs: https://render.com/docs/blueprint-spec
+#
+# Deploys the Telegram long-polling bot as a Docker web service.
+# bot.py starts a lightweight HTTP health server on 0.0.0.0:$PORT,
+# which satisfies Render's port-binding + health check requirements.
+services:
+  - type: web
+    name: gretta-telegram-bot
+    runtime: docker
+    branch: main
+    plan: free # NOTE: free tier sleeps after ~15 min without inbound HTTP (see README)
+    autoDeploy: true
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /
+    envVars:
+      # ---- REQUIRED (values entered in Render Dashboard, never committed) ----
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+
+      # ---- OPTIONAL ----
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: DASHBOARD_URL
+        sync: false # public URL of the Vercel dashboard, e.g. https://your-app.vercel.app
+
+      # ---- SHARED DATABASE (recommended) ----
+      # Neon Postgres connection string so the Render bot and the Vercel
+      # dashboard see the same leads. Without it each service falls back
+      # to its own throwaway SQLite file.
+      - key: DATABASE_URL
+        sync: false
+      - key: MODEL
+        value: stealth/ox-alpha
+      # ox-alpha image path was 502-ing upstream; free NVIDIA vision model verified working.
+      # Revert to stealth/ox-alpha once its image support recovers.
+      - key: VISION_MODEL
+        value: nvidia/nemotron-nano-12b-v2-vl:free
+      # Render injects PORT automatically; bot.py reads it (default 7860).
+      # Do NOT pin DB_PATH: Render's filesystem is ephemeral on restarts.

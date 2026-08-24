@@ -1,11 +1,8 @@
 # Hugging Face Space Dockerfile for Gretta AI Telegram Bot
 FROM python:3.10-slim
 
-# Install system dependencies required by PaddleOCR and OpenCV
+# Install system dependencies (curl for health check verification)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1 \
-    libglib2.0-0 \
-    libgomp1 \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -19,7 +16,7 @@ RUN pip install --no-cache-dir -r requirements-bot.txt
 # Copy application code
 COPY . .
 
-# Expose port 7860 for Hugging Face Spaces health checks
+# Expose default health-check port (HF Spaces uses 7860; Render overrides via PORT)
 EXPOSE 7860
 
 # Run the Telegram Bot
