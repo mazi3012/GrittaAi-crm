@@ -78,10 +78,10 @@ uvicorn dashboard:app --host 0.0.0.0 --port 8000
 ### 3. Host FastAPI Dashboard on Vercel (Free)
 
 1. Import your repository (`mazi3012/GrittaAi-crm.git`) into [Vercel](https://vercel.com/new).
-2. Vercel automatically detects `vercel.json` and configures the `@vercel/python` builder for `dashboard.py`.
-3. In Project Settings -> **Environment Variables**, optionally set:
-   - `DB_PATH` = `/tmp/crm.db` (for serverless environments)
-4. Deploy! Your CRM dashboard will be live at `https://your-project.vercel.app`.
+2. Vercel automatically detects the root-level `index.py` FastAPI entrypoint.
+3. In Project Settings -> **Environment Variables**, set `DATABASE_URL` to the same Neon Postgres connection string used by the Telegram bot.
+4. For a temporary SQLite-only deployment, set `DB_PATH` to `/tmp/crm.db`; Vercel storage is otherwise ephemeral and should not be used as the shared CRM database.
+5. Deploy! Your CRM dashboard will be live at `https://your-project.vercel.app`.
 
 ---
 
@@ -95,7 +95,7 @@ uvicorn dashboard:app --host 0.0.0.0 --port 8000
 | `static/` | Next-Gen SPA dashboard (HTML, CSS, JS with Obsidian/Slate theme support) |
 | `Dockerfile` | Docker configuration for Hugging Face Spaces / Render deployment |
 | `render.yaml` | Render Blueprint for one-click Telegram bot deployment |
-| `vercel.json` | Serverless configuration for Vercel deployment |
+| `index.py` | Root FastAPI entrypoint discovered automatically by Vercel |
 | `knowledge.txt` | Gretta's sales persona and prompt rules |
 
 ---
