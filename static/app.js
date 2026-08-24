@@ -5,14 +5,30 @@
 "use strict";
 
 /* ---------- constants ---------- */
-const STAGES = ["New", "Contacted", "Meeting Booked", "Converted", "Lost"];
+const STAGES = ["New", "Contacted", "Meeting Booked", "Converted", "Cancelled", "Lost"];
 const SCORES = ["HIGH", "MEDIUM", "LOW", "UNKNOWN"];
-const SDOT = { "New": "#94a3b8", "Contacted": "#38bdf8", "Meeting Booked": "#a78bfa", "Converted": "#34d399", "Lost": "#f87171" };
+/* Customer-facing names: a CONVERTED deal is an ACTIVE CLIENT of the service */
+const STAGE_LABEL = { "Converted": "Active Client" };
+const disp = (st) => STAGE_LABEL[st] || st;
+/* Pipeline guardrails — mirror of db.STAGE_TRANSITIONS, keep them in sync!
+   An Active Client can ONLY be cancelled; a Cancelled client can only be
+   re-activated. Nobody can drag a won client back into prospecting. */
+const TRANSITIONS = {
+  "New": ["Contacted", "Meeting Booked", "Converted", "Lost"],
+  "Contacted": ["New", "Meeting Booked", "Converted", "Lost"],
+  "Meeting Booked": ["New", "Contacted", "Converted", "Lost"],
+  "Converted": ["Cancelled"],
+  "Cancelled": ["Converted"],
+  "Lost": ["New", "Contacted", "Meeting Booked", "Converted"],
+};
+const allowedTargets = (status) => TRANSITIONS[status || "New"] || [];
+const SDOT = { "New": "#94a3b8", "Contacted": "#38bdf8", "Meeting Booked": "#a78bfa", "Converted": "#34d399", "Cancelled": "#fb923c", "Lost": "#f87171" };
 const SCOL = { HIGH: "#34d399", MEDIUM: "#fbbf24", LOW: "#f87171", UNKNOWN: "#64748b" };
-const SKEY = { "New": "New", "Contacted": "Contacted", "Meeting Booked": "MB", "Converted": "Converted", "Lost": "Lost" };
+const SKEY = { "New": "New", "Contacted": "Contacted", "Meeting Booked": "MB", "Converted": "Converted", "Cancelled": "Cancelled", "Lost": "Lost" };
 
 /* ---------- state ---------- */
-let LEADS = [], STATS = {}, OWNERS = [];
+let LEADS = [], STATS = {}, OWNERS = [], USERS = [];
+let AUTH_REQUIRED = false;
 let FILTER = { stage: "", score: "", owner: "", q: "" };
 let SORT = { key: "updated", dir: -1 };
 let VIEW = "overview";
@@ -28,7 +44,12 @@ async function api(path, opts = {}) {
     ...opts,
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (res.status === 401 && !path.startsWith("/api/auth/")) showLogin();
+  if (!res.ok) {
+    let msg = `${res.status} ${res.statusText}`;
+    try { const j = await res.json(); if (j.error) msg = j.error; } catch {}
+    throw new Error(msg);
+  }
   return res.json();
 }
 
@@ -140,8 +161,9 @@ function renderOverview() {
   <div class="stagger" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:13px;margin-bottom:14px;">
     ${kpi("kTotal", "Total Leads", "👥", "rgba(52,211,153,.14)", "rgba(52,211,153,.35)")}
     ${kpi("kHot", "Hot Leads", "🔥", "rgba(251,191,36,.14)", "rgba(251,191,36,.35)")}
-    ${kpi("kConv", "Converted", "🏆", "rgba(167,139,250,.14)", "rgba(167,139,250,.35)")}
+    ${kpi("kConv", "Active Clients", "🏆", "rgba(52,211,153,.18)", "rgba(52,211,153,.45)")}
     ${kpi("kMeet", "Meetings Booked", "📅", "rgba(56,189,248,.14)", "rgba(56,189,248,.35)")}
+    ${kpi("kCanc", "Cancelled", "🚫", "rgba(251,146,60,.14)", "rgba(251,146,60,.32)")}
     ${kpi("kUncl", "Unclaimed", "◌", "rgba(248,113,113,.13)", "rgba(248,113,113,.3)")}
   </div>
 
@@ -156,7 +178,7 @@ function renderOverview() {
         const w = Math.max(n ? (n / Math.max(...counts, 1)) * 100 : 2, 2);
         return `<div class="funnel-row ${FILTER.stage === st ? "sel" : ""}" data-fstage="${esc(st)}">
           <span style="font-size:12.5px;font-weight:650;color:${SDOT[st]};display:flex;align-items:center;gap:7px;">
-            <span style="width:8px;height:8px;border-radius:99px;background:${SDOT[st]};"></span>${esc(st)}</span>
+            <span style="width:8px;height:8px;border-radius:99px;background:${SDOT[st]};"></span>${esc(disp(st))}</span>
           <div class="funnel-track"><div class="funnel-fill" style="width:${w}%;background:linear-gradient(90deg,${SDOT[st]}55,${SDOT[st]});"></div></div>
           <b class="mono" style="text-align:right;color:var(--txt-2);">${n}</b>
         </div>`;
@@ -187,6 +209,7 @@ function renderOverview() {
   animateNum($("kHot"), s.hot);
   animateNum($("kConv"), s.converted);
   animateNum($("kMeet"), s.meetings);
+  animateNum($("kCanc"), s.cancelled || 0);
   animateNum($("kUncl"), s.unclaimed);
 
   const engaged = LEADS.filter(l => l.status !== "New").length;
@@ -317,7 +340,7 @@ function renderBoard() {
     <div class="kanban-col glass" data-stage="${esc(st)}">
       <div class="col-head">
         <span class="col-dot" style="background:${SDOT[st]};box-shadow:0 0 12px ${SDOT[st]}66;"></span>
-        <span style="font-weight:750;font-size:13px;color:${SDOT[st]};">${esc(st)}</span>
+        <span style="font-weight:750;font-size:13px;color:${SDOT[st]};">${esc(disp(st))}</span>
         <span class="col-count mono">${cards.length}</span>
       </div>
       <div class="col-cards" data-drop="${esc(st)}">
@@ -359,7 +382,7 @@ function renderLeads() {
   <div class="glass fade-in" style="padding:14px;margin-bottom:12px;display:flex;flex-wrap:wrap;gap:9px;align-items:center;">
     <select id="fStage" class="fsel">
       <option value="">All stages</option>
-      ${STAGES.map(s => `<option ${FILTER.stage === s ? "selected" : ""}>${s}</option>`).join("")}
+      ${STAGES.map(s => `<option value="${esc(s)}" ${FILTER.stage === s ? "selected" : ""}>${esc(disp(s))}</option>`).join("")}
     </select>
     <select id="fScore" class="fsel">
       <option value="">All scores</option>
@@ -463,9 +486,21 @@ function renderDrawer(l) {
 
     <div class="drawer-section">
       <div class="drawer-label">Move to stage</div>
+      ${l.status === "Converted" ? `
+      <div class="lock-note">🔒 <b>Active Client</b> is locked — the only change possible is cancelling the deal.</div>
       <div class="stage-jump">
-        ${STAGES.map(st => `<button data-stage-jump="${esc(st)}" class="${l.status === st ? "cur" : ""}">${esc(st)}</button>`).join("")}
-      </div>
+        <button class="cur" disabled>🏆 Active Client ✓</button>
+        <button class="danger-jump" data-stage-jump="Cancelled">🚫 Cancel Deal</button>
+      </div>` : l.status === "Cancelled" ? `
+      <div class="lock-note">🚫 This client cancelled and left the service.</div>
+      <div class="stage-jump">
+        <button class="cur" disabled>🚫 Cancelled ✓</button>
+        <button data-stage-jump="Converted">♻️ Re-activate (Active Client)</button>
+      </div>` : `
+      <div class="stage-jump">
+        <button class="cur" disabled>${esc(disp(l.status))} ✓</button>
+        ${allowedTargets(l.status).map(st => `<button data-stage-jump="${esc(st)}">${st === "Converted" ? "🏆 Active Client" : esc(disp(st))}</button>`).join("")}
+      </div>`}
     </div>
 
     <div class="drawer-section">
@@ -504,7 +539,7 @@ function renderDrawer(l) {
       <div class="drawer-label">Edit lead</div>
       <div class="edit-grid">
         <label>Stage
-          <select id="editStatus">${STAGES.map(st => `<option ${l.status === st ? "selected" : ""}>${esc(st)}</option>`).join("")}</select>
+          <select id="editStatus">${[...new Set([l.status, ...allowedTargets(l.status)])].map(st => `<option value="${esc(st)}" ${l.status === st ? "selected" : ""}>${st === "Converted" ? "🏆 Active Client" : esc(disp(st))}</option>`).join("")}</select>
         </label>
         <label>Intent score
           <select id="editScore">${["HIGH", "MEDIUM", "LOW", "UNKNOWN"].map(sc => `<option ${l.score === sc ? "selected" : ""}>${sc}</option>`).join("")}</select>
@@ -566,6 +601,110 @@ function exportCsv() {
 }
 
 /* ============================================================
+   BOT ACCESS VIEW — Telegram user audit & whitelist
+   ============================================================ */
+async function loadUsers() {
+  try {
+    const data = await api("/api/users");
+    USERS = data.users || [];
+    renderAccess();
+  } catch (e) { toast(e.message || "Couldn't load bot users", "err"); }
+}
+
+function renderAccess() {
+  const el = $("view-access");
+  const rows = [...USERS].sort((a, b) =>
+    (b.authorized - a.authorized) || (b.msg_count - a.msg_count));
+  el.innerHTML = `
+  <div class="glass fade-in" style="padding:16px;margin-bottom:12px;">
+    <div style="font-weight:750;font-size:15px;">🛡 Bot Access Control</div>
+    <div style="font-size:12px;color:var(--txt-3);margin-top:4px;max-width:760px;line-height:1.55;">
+      Every Telegram account that ever messaged the bot is logged here —
+      including strangers who were refused. ✅ Allowed users can use Gretta;
+      ⛔ Blocked users were turned away. Hard server-side lockdown: set
+      <code>ALLOWED_TELEGRAM_IDS</code> / <code>ALLOWED_TELEGRAM_USERNAMES</code>
+      on the bot service.</div>
+  </div>
+  <div class="glass" style="overflow:hidden;">
+    <div style="overflow-x:auto;">
+      <table class="tbl">
+        <thead><tr>
+          <th>User</th><th>Name</th><th>Telegram ID</th><th>Status</th>
+          <th>Msgs</th><th>First seen</th><th>Last seen</th><th></th>
+        </tr></thead>
+        <tbody>
+          ${rows.length ? rows.map(u => `
+          <tr>
+            <td style="font-weight:700;">${esc(u.username || "—")}</td>
+            <td>${esc(u.first_name || "—")}</td>
+            <td class="mono" style="font-size:12px;">${esc(u.telegram_id)}</td>
+            <td><span class="chip ${u.authorized ? "u-on" : "u-off"}">${u.authorized ? "✅ Allowed" : "⛔ Blocked"}</span></td>
+            <td class="mono">${u.msg_count}</td>
+            <td style="color:var(--txt-3);font-size:11.5px;">${esc((u.first_seen || "").replace("T", " ").slice(0, 16))}</td>
+            <td style="color:var(--txt-3);font-size:11.5px;">${esc((u.last_seen || "").replace("T", " ").slice(0, 16))}</td>
+            <td><button class="mini-btn" data-uact="${esc(u.telegram_id)}" data-unext="${u.authorized ? "" : "1"}">${u.authorized ? "Deny" : "Allow"}</button></td>
+          </tr>`).join("") : `
+          <tr><td colspan="8"><div class="empty-wrap" style="padding:44px 16px;">
+            <span class="empty-ico" style="font-size:34px;">🛡</span>
+            <div style="font-weight:700;">No bot users yet</div>
+            <div style="color:var(--txt-3);font-size:12.5px;margin-top:4px;">Anyone who messages the bot on Telegram will appear here automatically.</div>
+          </div></td></tr>`}
+        </tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+/* ============================================================
+   ADMIN AUTH — login gate / sign out
+   ============================================================ */
+function showLogin() {
+  const gate = $("loginGate");
+  if (!gate) return;
+  gate.style.display = "flex";
+  setTimeout(() => { const p = $("loginPass"); if (p && !p.value) p.focus(); }, 60);
+}
+function hideLogin() { const g = $("loginGate"); if (g) g.style.display = "none"; }
+
+async function initAuth() {
+  let auth_required = false, authenticated = true;
+  try {
+    const s = await api("/api/auth/status");
+    auth_required = !!s.auth_required;
+    authenticated = !!s.authenticated;
+  } catch {}
+  AUTH_REQUIRED = auth_required;
+  $("logoutBtn").style.display = auth_required ? "" : "none";
+  return !auth_required || authenticated;
+}
+
+function wireLogin() {
+  $("loginForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = $("loginSubmitBtn");
+    btn.disabled = true;
+    try {
+      await api("/api/auth/login", { method: "POST", body: {
+        username: $("loginUser").value,
+        password: $("loginPass").value,
+      } });
+      $("loginErr").textContent = "";
+      $("loginPass").value = "";
+      hideLogin();
+      await load();
+      startPolling();
+    } catch (err) {
+      $("loginErr").textContent = err.message || "Sign-in failed";
+    } finally { btn.disabled = false; }
+  });
+  $("logoutBtn").addEventListener("click", async () => {
+    clearInterval(TIMER);
+    try { await api("/api/auth/logout", { method: "POST", body: {} }); } catch {}
+    location.reload();
+  });
+}
+
+/* ============================================================
    DATA LOAD + LIVE POLLING
    ============================================================ */
 async function load({ silent = false } = {}) {
@@ -624,6 +763,7 @@ function render() {
   if (VIEW === "overview") renderOverview();
   else if (VIEW === "board") renderBoard();
   else if (VIEW === "leads") renderLeads();
+  else if (VIEW === "access") renderAccess();
 
   document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.view === VIEW));
 }
@@ -631,14 +771,15 @@ function render() {
 function switchView(v) {
   VIEW = v;
   if (location.hash !== `#/${v}`) { location.hash = `#/${v}`; return; } // hashchange re-enters with VIEW set
-  for (const id of ["overview", "board", "leads"]) $(`view-${id}`).style.display = id === v ? "" : "none";
+  for (const id of ["overview", "board", "leads", "access"]) $(`view-${id}`).style.display = id === v ? "" : "none";
   render();
+  if (v === "access") loadUsers();
   $("sidebar").classList.remove("open"); // close mobile drawer after nav
 }
 
 function viewFromHash() {
   const h = location.hash.replace(/^#\/?/, "");
-  return ["overview", "board", "leads"].includes(h) ? h : "overview";
+  return ["overview", "board", "leads", "access"].includes(h) ? h : "overview";
 }
 /* ============================================================
    COMMAND PALETTE (⌘/Ctrl+K)
@@ -655,10 +796,16 @@ function closeCmdk() { $("cmdk").classList.remove("show"); }
 
 function buildCmdk(q) {
   q = q.trim().toLowerCase();
-  CMDK_ITEMS = [
-    ...["overview", "board", "leads"].map(v => ({ icon: v === "overview" ? "📊" : v === "board" ? "🗂" : "📋", label: `Go to ${v === "board" ? "Pipeline Board" : v === "leads" ? "All Leads" : "Overview"}`, act: () => switchView(v) })),
+  const VIEWS_META = [
+  ["overview", "📊", "Overview"],
+  ["board", "🗂", "Pipeline Board"],
+  ["leads", "📋", "All Leads"],
+  ["access", "🛡", "Bot Access"],
+];
+CMDK_ITEMS = [
+    ...VIEWS_META.map(([v, icon, label]) => ({ icon, label: `Go to ${label}`, act: () => switchView(v) })),
     ...LEADS.filter(l => !q || l.username.toLowerCase().includes(q)).slice(0, 8).map(l => ({
-      icon: "🎯", label: `${l.username} — ${l.status}`, act: () => openDrawer(l.username),
+      icon: "🎯", label: `${l.username} — ${disp(l.status)}`, act: () => openDrawer(l.username),
     })),
   ].filter(it => it.icon !== "🎯" || q); // lead items only when searching
   $("cmdkList").innerHTML = CMDK_ITEMS.length
@@ -672,13 +819,22 @@ function buildCmdk(q) {
 async function moveLead(username, stage) {
   const l = LEADS.find(x => x.username === username);
   if (!l || l.status === stage) return;
+  /* Client-side mirror of the server guardrails (db.STAGE_TRANSITIONS):
+     an Active Client can only be cancelled, a Cancelled client only
+     re-activated — never back into prospecting. */
+  if (!allowedTargets(l.status).includes(stage)) {
+    toast(l.status === "Converted"
+      ? "🔒 Active Client locked — the only change is 🚫 Cancel Deal"
+      : `🔒 Can't move a ${disp(l.status)} lead to ${disp(stage)}`, "err");
+    return;
+  }
   try {
     await api("/api/lead/stage", { method: "POST", body: { username, stage } });
     l.status = stage;
-    toast(`${username} → ${stage}`);
+    toast(`${username} → ${disp(stage)}`);
     render();
     if ($("drawer").classList.contains("open")) openDrawer(username);
-  } catch { toast("Move failed — is the backend up?", "err"); }
+  } catch (e) { toast(e.message || "Move failed — is the backend up?", "err"); }
 }
 
 async function doReassign(name) {
@@ -709,7 +865,7 @@ async function saveEdits() {
     toast(`${l.username} updated`);
     await load({ silent: true });
     openDrawer(l.username);
-  } catch { toast("Save failed — check stage/score values", "err"); }
+  } catch (e) { toast(e.message || "Save failed — check stage/score values", "err"); }
 }
 /* ============================================================
    EVENT WIRING
@@ -739,6 +895,16 @@ function wireEvents() {
     if (fownerBtn) { FILTER.owner = fownerBtn.dataset.fownerBtn; switchView("leads"); return; }
     const fowner = e.target.closest("[data-fowner]");
     if (fowner) { FILTER.owner = FILTER.owner === fowner.dataset.fowner ? "" : fowner.dataset.fowner; render(); return; }
+    const uact = e.target.closest("[data-uact]");
+    if (uact) {
+      const grant = uact.dataset.unext === "1";
+      try {
+        await api("/api/user/access", { method: "POST", body: { user_id: uact.dataset.uact, authorized: grant } });
+        toast(grant ? "User whitelisted ✅" : "Access revoked ⛔");
+        loadUsers();
+      } catch (err) { toast(err.message || "Update failed", "err"); }
+      return;
+    }
     const open = e.target.closest("[data-open]");
     if (open) { openDrawer(open.dataset.open); return; }
     const rowCard = e.target.closest("tr[data-user], .lead-card");
@@ -891,5 +1057,12 @@ document.addEventListener("DOMContentLoaded", () => {
   wireDrawerEvents();
   wireTableEvents();
   wireDragAndDrop();
-  load().then(startPolling);
+  wireLogin();
+
+  /* Auth gate first: only start polling the CRM once we may see it. */
+  initAuth().then((mayEnter) => {
+    if (!AUTH_REQUIRED) $("logoutBtn").style.display = "none";
+    if (mayEnter) load().then(startPolling);
+    else showLogin();
+  });
 });

@@ -25,6 +25,7 @@ Optimizations:
 """
 
 import base64
+import functools
 import html
 import io
 import json
@@ -58,28 +59,121 @@ if not TELEGRAM_TOKEN or not OPENROUTER_API_KEY:
     raise ValueError("Error: TELEGRAM_TOKEN or OPENROUTER_API_KEY missing from .env!")
 
 from db import (  # noqa: E402  (after env validation)
+    all_bot_users,
     all_leads,
+    allowed_transitions,
+    bot_user_allowed,
+    find_bot_user,
     get_lead,
     leads_for_owner,
     normalize_username,
     save_lead,
+    set_bot_user_authorized,
     set_lead_stage,
+    track_bot_user,
 )
 
 MAX_IMAGE_DIM = 1600      # px - screenshots scaled for fast vision encoding
 MAX_SUMMARY_CHARS = 500   # cap stored summary length
 TG_MSG_LIMIT = 3900       # split long replies (Telegram hard-caps at 4096)
 
-STAGES = ["New", "Contacted", "Meeting Booked", "Converted", "Lost"]
+STAGES = ["New", "Contacted", "Meeting Booked", "Converted", "Cancelled", "Lost"]
 SCORE_EMOJI = {"HIGH": "🔥", "MEDIUM": "🟡", "LOW": "🧊"}
 STAGE_EMOJI = {
     "New": "🆕", "Contacted": "📨", "Meeting Booked": "📅",
-    "Converted": "🏆", "Lost": "❌",
+    "Converted": "🏆", "Cancelled": "🚫", "Lost": "❌",
 }
+# Customer-facing names: a CONVERTED deal is an ACTIVE CLIENT of the service.
+STAGE_LABEL = {"Converted": "Active Client"}
+
+
+def stage_display(stage):
+    """Human-friendly stage name ('Converted' -> 'Active Client')."""
+    return STAGE_LABEL.get(stage, stage)
+
+
 CHAT_MEMORY_TURNS = 6     # user+assistant exchanges kept per chat
 CHAT_MAX_CHARS = 1200     # cap per stored chat turn (token safety)
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
+
+# ---------------------------------------------------------------- access gate
+# Private-bot mode. Leave BOTH env vars empty to keep the bot open to anyone
+# (every account is still logged into bot_users for auditing). Set either one
+# and only whitelisted teammates get through — strangers are refused politely
+# AND recorded, so /users shows exactly who tried to use the bot.
+def _csv_env(name):
+    raw = os.getenv(name, "")
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+ALLOWED_IDS = _csv_env("ALLOWED_TELEGRAM_IDS")
+ALLOWED_UNAMES = {_norm.lower() for _norm in
+                  ("@" + u.lstrip("@") for u in _csv_env("ALLOWED_TELEGRAM_USERNAMES"))}
+OPEN_ACCESS = not ALLOWED_IDS and not ALLOWED_UNAMES
+
+
+def _refuse(chat_id, tg_user):
+    """Tell a stranger they're not on the team list (and log them)."""
+    handle = f"@{tg_user.username}" if getattr(tg_user, "username", None) else "no @handle"
+    bot.send_message(
+        chat_id,
+        "⛔ <b>Private bot.</b>\n"
+        "You're not on this workspace's team list, so Gretta can't help you "
+        "here.\n\n"
+        f"Your Telegram ID: <code>{getattr(tg_user, 'id', '?')}</code> ({handle})\n"
+        "Send that ID to the admin to get access.",
+        parse_mode="HTML",
+    )
+
+
+def _gate(tg_user, chat_id) -> bool:
+    """Track + authorize one interaction. True when the user may proceed."""
+    tid = str(getattr(tg_user, "id", "") or "")
+    uname = f"@{getattr(tg_user, 'username', None)}" if getattr(tg_user, "username", None) else None
+    try:
+        track_bot_user(tid, uname, getattr(tg_user, "first_name", None))
+    except Exception as exc:
+        print(f"bot_users tracking failed: {exc}")
+    if OPEN_ACCESS:
+        return True
+    if tid in ALLOWED_IDS or (uname and uname.lower() in ALLOWED_UNAMES):
+        return True
+    try:
+        if bot_user_allowed(tid, uname):
+            return True
+    except Exception as exc:
+        print(f"bot_users lookup failed: {exc}")
+    return False
+
+
+def member_only(fn):
+    """Decorator for message handlers: refuse non-teammates."""
+    @functools.wraps(fn)
+    def wrapper(message, *args, **kwargs):
+        user = getattr(message, "from_user", None)
+        if user is None or _gate(user, message.chat.id):
+            return fn(message, *args, **kwargs)
+        _refuse(message.chat.id, user)
+        return None
+    return wrapper
+
+
+def member_callback(fn):
+    """Decorator for callback-query handlers: refuse non-teammates."""
+    @functools.wraps(fn)
+    def wrapper(call, *args, **kwargs):
+        user = getattr(call, "from_user", None)
+        chat_id = call.message.chat.id if call.message else call.from_user.id
+        if user is None or _gate(user, chat_id):
+            return fn(call, *args, **kwargs)
+        _refuse(chat_id, user)
+        try:
+            bot.answer_callback_query(call.id)
+        except Exception:
+            pass
+        return None
+    return wrapper
 
 # ------------------------------------------------------------- chat memory
 # Per-chat rolling window of {"role": ..., "content": ...} for free-text chat.
@@ -160,6 +254,9 @@ def register_bot_commands():
             types.BotCommand("check", "Check a lead — /check @username"),
             types.BotCommand("claim", "Claim a lead — /claim @username"),
             types.BotCommand("stats", "Team pipeline summary"),
+            types.BotCommand("users", "Audit who is using the bot (team)"),
+            types.BotCommand("allow", "Whitelist a user — /allow <id>"),
+            types.BotCommand("deny", "Revoke a user — /deny <id>"),
             types.BotCommand("help", "How to use Gretta"),
         ])
     except Exception as exc:
@@ -368,9 +465,10 @@ def lead_card(lead):
     next_steps, summary, updated = lead[5], lead[6], lead[7]
     score_tag = SCORE_EMOJI.get(score, "⚪️")
     stage_tag = STAGE_EMOJI.get(status, "•")
+    lock_tag = " 🔒" if status in ("Converted", "Cancelled") else ""
     return (
         f"👤 <b>{esc(username)}</b>  {score_tag} <i>{esc(score)}</i>\n"
-        f"{stage_tag} Stage: <b>{esc(status or 'New')}</b>\n"
+        f"{stage_tag} Stage: <b>{esc(stage_display(status or 'New'))}</b>{lock_tag}\n"
         f"📱 Platform: {esc(platform or 'Instagram')}\n"
         f"🧑‍💼 Owner: <b>{esc(owner) if owner else 'Unclaimed'}</b>\n"
         f"🎯 Next: {esc(next_steps or 'Review lead')}\n"
@@ -380,14 +478,37 @@ def lead_card(lead):
 
 
 def stage_kb(username):
-    """One-tap deal-stage mover for a lead card."""
+    """Stage buttons tailored to the lead's current pipeline position.
+
+    An ACTIVE CLIENT (Converted) is locked: the only change offered is an
+    explicit 🚫 Cancel Deal. A Cancelled client can only be re-activated.
+    Open leads can move to any legal next stage (db.STAGE_TRANSITIONS).
+    """
     kb = types.InlineKeyboardMarkup(row_width=3)
-    kb.add(*[
-        types.InlineKeyboardButton(
-            f"{STAGE_EMOJI[s]} {s}", callback_data=f"stage:{username}:{s}"
-        )
-        for s in STAGES
-    ])
+    lead = get_lead(username)
+    current = (lead[2] if lead else None) or "New"
+
+    if current == "Converted":
+        kb.add(types.InlineKeyboardButton(
+            f"🏆 {stage_display(current)} ✅", callback_data="noop"))
+        kb.add(types.InlineKeyboardButton(
+            "🚫 Cancel Deal", callback_data=f"stage:{username}:Cancelled"))
+    elif current == "Cancelled":
+        kb.add(types.InlineKeyboardButton(
+            "♻️ Re-activate (Active Client)",
+            callback_data=f"stage:{username}:Converted"))
+    else:
+        buttons = [types.InlineKeyboardButton(
+            f"{STAGE_EMOJI.get(current, '📍')} {current} ✓",
+            callback_data="noop")]
+        buttons += [
+            types.InlineKeyboardButton(
+                "🏆 Active Client" if s == "Converted" else f"{STAGE_EMOJI[s]} {s}",
+                callback_data=f"stage:{username}:{s}",
+            )
+            for s in allowed_transitions(current)
+        ]
+        kb.add(*buttons)
     kb.add(types.InlineKeyboardButton("🏠 Home", callback_data="menu:home"))
     return kb
 
@@ -440,6 +561,7 @@ def leads_kb(buttons):
 
 
 @bot.message_handler(commands=["start"])
+@member_only
 def send_welcome(message):
     bot.send_message(
         message.chat.id,
@@ -464,6 +586,7 @@ def run_claim(username, claimer):
 
 
 @bot.message_handler(commands=["claim"])
+@member_only
 def handle_claim(message):
     parts = (message.text or "").split()
     if len(parts) < 2:
@@ -480,6 +603,7 @@ def handle_claim(message):
 
 
 @bot.message_handler(commands=["check"])
+@member_only
 def handle_check(message):
     parts = (message.text or "").split()
     if len(parts) < 2:
@@ -494,6 +618,7 @@ def handle_check(message):
 
 
 @bot.message_handler(commands=["leads"])
+@member_only
 def handle_leads(message):
     viewer = sender_handle(message)
     rows = leads_for_owner(viewer)
@@ -503,6 +628,7 @@ def handle_leads(message):
 
 
 @bot.message_handler(commands=["stats"])
+@member_only
 def handle_stats(message):
     rows = all_leads()
     total = len(rows)
@@ -524,9 +650,11 @@ def handle_stats(message):
     for stage in STAGES:
         n = by_stage.get(stage, 0)
         bar = "█" * n if n else ""
-        lines.append(f"{STAGE_EMOJI.get(stage, '▫️')} <b>{stage}</b>: {n} {bar}")
+        lines.append(f"{STAGE_EMOJI.get(stage, '▫️')} <b>{stage_display(stage)}</b>: {n} {bar}")
     lines.append("")
     lines.append(f"Total leads: <b>{total}</b>")
+    lines.append(f"🏆 Active Clients: <b>{by_stage.get('Converted', 0)}</b>")
+    lines.append(f"🚫 Cancelled clients: <b>{by_stage.get('Cancelled', 0)}</b>")
     lines.append(f"🔥 Hot (HIGH score): <b>{hot}</b>")
     lines.append(f"🟢 Unclaimed: <b>{unclaimed}</b>")
     bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML",
@@ -534,6 +662,7 @@ def handle_stats(message):
 
 
 @bot.message_handler(commands=["help"])
+@member_only
 def handle_help(message):
     bot.send_message(
         message.chat.id,
@@ -776,6 +905,7 @@ def advice_for_screenshot(chat_id, status, image_bytes, target):
 
 
 @bot.message_handler(content_types=["photo"])
+@member_only
 def handle_photo(message):
     try:
         start_screenshot_flow(message, message.photo[-1].file_id)
@@ -788,6 +918,7 @@ def handle_photo(message):
 
 
 @bot.message_handler(content_types=["document"])
+@member_only
 def handle_document(message):
     """Users often forward screenshots as files (no compression) — support it."""
     mime = getattr(message.document, "mime_type", "") or ""
@@ -811,6 +942,7 @@ def handle_document(message):
 
 # --------------------------------------------------------------- callbacks
 @bot.callback_query_handler(func=lambda c: c.data.startswith("menu:"))
+@member_callback
 def on_menu(call):
     chat_id = call.message.chat.id
     data = call.data
@@ -853,6 +985,7 @@ def on_menu(call):
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("lead:"))
+@member_callback
 def on_lead_card(call):
     username = call.data[len("lead:"):]
     lead = get_lead(username)
@@ -871,6 +1004,7 @@ def on_lead_card(call):
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("stage:"))
+@member_callback
 def on_stage_change(call):
     try:
         _, username, new_stage = call.data.split(":", 2)
@@ -880,9 +1014,17 @@ def on_stage_change(call):
     if new_stage not in STAGES:
         bot.answer_callback_query(call.id, "Unknown stage.")
         return
-    set_lead_stage(username, new_stage)
+    if not set_lead_stage(username, new_stage):
+        bot.answer_callback_query(
+            call.id,
+            "🔒 Locked. Active Clients can only be cancelled; cancelled "
+            "clients can only be re-activated.",
+            show_alert=True,
+        )
+        return
     lead = get_lead(username)
-    toast = f"{STAGE_EMOJI.get(new_stage, '✅')} {normalize_username(username)} → {new_stage}"
+    toast = (f"{STAGE_EMOJI.get(new_stage, '✅')} "
+             f"{normalize_username(username)} → {stage_display(new_stage)}")
     try:
         bot.edit_message_text(lead_card(lead), call.message.chat.id,
                               call.message.message_id, parse_mode="HTML",
@@ -893,6 +1035,7 @@ def on_stage_change(call):
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("claim:"))
+@member_callback
 def on_claim_button(call):
     username = call.data[len("claim:"):]
     claimer = sender_handle(call.message)
@@ -909,6 +1052,7 @@ def on_claim_button(call):
 
 # ------------------------------------------------------- screenshot actions
 @bot.callback_query_handler(func=lambda c: c.data.startswith("shot:"))
+@member_callback
 def on_shot_action(call):
     chat_id = call.message.chat.id
     action = call.data[len("shot:"):]
@@ -952,6 +1096,79 @@ def on_shot_action(call):
     ).start()
 
 
+@bot.callback_query_handler(func=lambda c: c.data == "noop")
+def on_noop(call):
+    """Tapped the current-stage chip (or a locked Active Client row)."""
+    bot.answer_callback_query(call.id, "🔒 This stage is locked.",
+                              show_alert=False)
+
+
+# ------------------------------------------------- access admin (team-only)
+@bot.message_handler(commands=["users"])
+@member_only
+def handle_users(message):
+    """Audit every Telegram account that has talked to the bot."""
+    rows = all_bot_users()
+    if not rows:
+        bot.send_message(message.chat.id,
+                         "🛡 No Telegram user has talked to me yet.",
+                         reply_markup=home_button_kb())
+        return
+    mode = ("🌍 OPEN to everyone — set ALLOWED_TELEGRAM_IDS to lock down"
+            if OPEN_ACCESS else "🔒 PRIVATE — whitelist active")
+    lines = [f"🛡 <b>Bot Users</b> · {mode}\n"]
+    for tid, uname, fname, auth, cnt, _first, last in rows[:25]:
+        badge = "✅" if auth else ("▫️" if OPEN_ACCESS else "⛔")
+        who = esc(uname or fname or "unknown")
+        lines.append(f"{badge} {who} · <code>{esc(tid)}</code> · "
+                     f"{cnt} msgs · {esc(str(last or ''))}")
+    if len(rows) > 25:
+        lines.append(f"\n…and {len(rows) - 25} more")
+    lines.append("\nWhitelist with: /allow <id-or-@username>")
+    bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML",
+                     reply_markup=home_button_kb())
+
+
+@bot.message_handler(commands=["allow", "deny"])
+@member_only
+def handle_allow_deny(message):
+    """/allow <id|@handle> whitelists a Telegram user; /deny revokes them."""
+    grant = message.text.split()[0].lstrip("/").lower() == "allow"
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        bot.send_message(
+            message.chat.id,
+            f"Usage: <code>/{'allow' if grant else 'deny'} "
+            "&lt;telegram-id-or-@username&gt;</code>",
+            parse_mode="HTML",
+        )
+        return
+    key = parts[1]
+    row = find_bot_user(key)
+    if row:
+        target_id, target_name = row[0], (row[1] or row[2] or row[0])
+    elif key.lstrip("@").isdigit():
+        # Unknown ID: create a stub entry so they're pre-approved on arrival.
+        target_id, target_name = key.lstrip("@"), key
+    else:
+        bot.send_message(
+            message.chat.id,
+            f"🤔 I've never seen <b>{esc(key)}</b> message the bot.\n"
+            "Ask them to send me any message once, then retry — or add "
+            "their numeric ID to ALLOWED_TELEGRAM_IDS.",
+            parse_mode="HTML", reply_markup=home_button_kb(),
+        )
+        return
+    set_bot_user_authorized(target_id, grant)
+    verb = "whitelisted ✅" if grant else "revoked ⛔"
+    bot.send_message(
+        message.chat.id,
+        f"🛡 <b>{esc(str(target_name))}</b> (<code>{esc(target_id)}</code>) "
+        f"{verb}.\nThey can {'now use' if grant else 'no longer use'} the bot.",
+        parse_mode="HTML", reply_markup=home_button_kb(),
+    )
+
+
 # ------------------------------------------------------------ free-text AI
 CHAT_SYSTEM_PROMPT = (
     "You are Gretta AI, a sharp, friendly enterprise-sales CRM assistant "
@@ -991,6 +1208,7 @@ def ask_ai_chat(user_text, chat_id):
     func=lambda m: m.content_type == "text" and not m.text.startswith("/"),
     content_types=["text"],
 )
+@member_only
 def handle_free_text(message):
     user_text = (message.text or "").strip()
     if not user_text:
@@ -1070,6 +1288,7 @@ def _keep_typing(chat_id, stop_evt):
 
 
 @bot.message_handler(func=lambda m: True)
+@member_only
 def fallback_everything_else(message):
     """Stickers, voice notes, video notes, anything unhandled."""
     bot.reply_to(

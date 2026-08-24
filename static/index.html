@@ -30,9 +30,11 @@
       <button class="nav-btn active" data-view="overview"><span class="ico">📊</span> Overview</button>
       <button class="nav-btn" data-view="board"><span class="ico">🗂</span> Pipeline Board</button>
       <button class="nav-btn" data-view="leads"><span class="ico">📋</span> All Leads</button>
+      <button class="nav-btn" data-view="access"><span class="ico">🛡</span> Bot Access</button>
     </nav>
 
     <div class="sidebar-footer">
+      <button id="logoutBtn" class="icon-btn" style="display:none;width:100%;" title="End the admin session">⏻ Sign out</button>
       <div class="health-card glass">
         <div class="health-label">Pipeline Health</div>
         <div class="bar-mini"><div id="healthBar" style="width:0%"></div></div>
@@ -72,6 +74,7 @@
       <section id="view-overview" class="view"></section>
       <section id="view-board" class="view" style="display:none;"></section>
       <section id="view-leads" class="view" style="display:none;"></section>
+      <section id="view-access" class="view" style="display:none;"></section>
     </main>
   </div>
 </div>
@@ -85,6 +88,19 @@
     <input id="cmdkInput" class="cmdk-input" placeholder="Jump to a lead or view…" autocomplete="off"/>
     <div id="cmdkList" class="cmdk-list"></div>
   </div>
+</div>
+
+<!-- ══════════ ADMIN LOGIN GATE ══════════ -->
+<div id="loginGate">
+  <form id="loginForm" class="glass login-box">
+    <span style="font-size:30px;">⚡</span>
+    <h2>Gretta CRM</h2>
+    <p>Admin sign-in required for this dashboard.</p>
+    <input id="loginUser" type="text" placeholder="Username" value="admin" autocomplete="username"/>
+    <input id="loginPass" type="password" placeholder="Password" autocomplete="current-password" required/>
+    <div id="loginErr" class="login-err"></div>
+    <button id="loginSubmitBtn" type="submit" class="icon-btn primary" style="width:100%;height:40px;">🔐 Sign in</button>
+  </form>
 </div>
 
 <div id="toasts"></div>

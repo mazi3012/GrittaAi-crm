@@ -112,5 +112,23 @@ uvicorn dashboard:app --host 0.0.0.0 --port 8000
 | `DATABASE_URL` | Neon Postgres connection string — shared DB for Render + Vercel; omit for local SQLite | — |
 | `DB_PATH` | Path to SQLite database (used only when `DATABASE_URL` is unset) | `crm.db` |
 | `PORT` | Health server / web port | `7860` (HF) / `8000` (Local) |
+| `ADMIN_USERNAME` | Dashboard admin username | `admin` |
+| `ADMIN_PASSWORD` | **Set it in prod!** Enables the dashboard sign-in gate (`/api/*` locked behind a signed HttpOnly session cookie). Empty = open API (local dev only). | — |
+| `ADMIN_SESSION_SECRET` | Optional cookie-signing secret; rotating signs out all sessions | falls back to `ADMIN_PASSWORD` |
+| `ALLOWED_TELEGRAM_IDS` | Comma-separated numeric Telegram IDs allowed to use the bot. Empty both lists = bot open to everyone (still fully logged). | — |
+| `ALLOWED_TELEGRAM_USERNAMES` | Comma-separated @handles allowed to use the bot | — |
 
 > ⚠️ Never commit `.env` to version control. Keep secrets in your environment settings on Hugging Face and Vercel.
+
+---
+
+## 🔒 Pipeline Rules & Access Control
+
+**Lead lifecycle:** `New → Contacted → Meeting Booked → Active Client`, plus `Lost`.
+- A **converted deal becomes an Active Client** (shown solid green everywhere). The stage is **locked**: nobody can drag it back to New/Contacted — from Telegram *or* the dashboard. The only exit is an explicit **🚫 Cancel Deal** when a client quits the service.
+- **Cancelled clients** can be ♻️ re-activated (moved back to Active Client) if they return.
+- Guardrails live once in `db.STAGE_TRANSITIONS` and are enforced by the DB layer itself — the UI merely mirrors them.
+
+**Dashboard auth:** set `ADMIN_PASSWORD` (e.g. in Vercel env vars) and the whole API requires signing in at the glass login screen. Sessions are stateless signed cookies (7 days) — no database needed, works across serverless cold starts. Sign out anytime from the sidebar.
+
+**Bot access control:** every Telegram account that messages the bot is recorded in the `bot_users` table (message counts, first/last seen, whitelist flag) — visible in the dashboard's **🛡 Bot Access** tab with Allow/Deny buttons, or via `/users` in Telegram. To hard-lock the bot, set `ALLOWED_TELEGRAM_IDS` / `ALLOWED_TELEGRAM_USERNAMES`; strangers then get a polite refusal showing their ID so you can `/allow <id>` them.

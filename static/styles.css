@@ -1215,3 +1215,88 @@ html[data-theme="dark"] .chip.score-LOW     { color: #f87171; }
   .hamburger-btn { display: inline-flex !important; }
   .top-search { width: 180px; }
 }
+
+/* ══════════════════════════════════════════════════════════════
+   ACTIVE CLIENT / CANCELLED stages + access control + login gate
+   ══════════════════════════════════════════════════════════════ */
+
+/* Converted deals are ACTIVE CLIENTS: solid green, locked */
+.chip.stage-Converted.locked-active,
+html[data-theme="dark"] .chip.stage-Converted.locked-active {
+  background: linear-gradient(135deg, #10b981, #059669);
+  color: #ffffff;
+  border-color: rgba(16, 185, 129, .55);
+  box-shadow: 0 0 14px rgba(16, 185, 129, .35);
+  font-weight: 800;
+}
+
+.chip.stage-Cancelled {
+  background: rgba(251, 146, 60, .14);
+  color: #c2410c;
+  border-color: rgba(251, 146, 60, .32);
+}
+html[data-theme="dark"] .chip.stage-Cancelled { color: #fb923c; }
+
+/* Drawer lock note + stage-jump states */
+.lock-note {
+  font-size: 12px;
+  color: var(--txt-2);
+  background: rgba(148, 163, 184, .08);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 10px;
+  margin-bottom: 9px;
+}
+.stage-jump button:disabled,
+.stage-jump button.cur[disabled] { opacity: .7; cursor: not-allowed; }
+.stage-jump button.danger-jump {
+  border-color: rgba(248, 113, 113, .45);
+  color: #ef4444;
+}
+html[data-theme="dark"] .stage-jump button.danger-jump { color: #f87171; }
+.stage-jump button.danger-jump:hover { background: rgba(248, 113, 113, .12); }
+
+/* Bot Access tab badges */
+.chip.u-on {
+  background: rgba(16, 185, 129, .15);
+  color: #059669;
+  border-color: rgba(16, 185, 129, .4);
+}
+html[data-theme="dark"] .chip.u-on { color: #34d399; }
+.chip.u-off {
+  background: rgba(248, 113, 113, .13);
+  color: #dc2626;
+  border-color: rgba(248, 113, 113, .3);
+}
+html[data-theme="dark"] .chip.u-off { color: #f87171; }
+
+/* Admin login gate */
+#loginGate {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(4, 8, 14, .72);
+  backdrop-filter: blur(9px);
+}
+.login-box {
+  width: min(340px, calc(100vw - 40px));
+  padding: 26px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  text-align: center;
+  align-items: center;
+  border-radius: 20px;
+}
+.login-box h2 { margin: 2px 0 0; font-size: 19px; letter-spacing: -.01em; }
+.login-box p { margin: 0; color: var(--txt-3); font-size: 12.5px; }
+.login-box input { width: 100%; }
+.login-err {
+  color: #f87171;
+  font-size: 12.5px;
+  min-height: 16px;
+  font-weight: 600;
+}
