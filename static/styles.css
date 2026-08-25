@@ -409,10 +409,12 @@ body {
 }
 
 .view {
+  display: none;
   height: 100%;
   overflow-y: auto;
   padding-right: 2px;
 }
+.view.active { display: block; }
 
 /* ══════════ KPI CARDS ══════════ */
 .kpi {
@@ -1300,3 +1302,38 @@ html[data-theme="dark"] .chip.u-off { color: #f87171; }
   min-height: 16px;
   font-weight: 600;
 }
+
+/* ══════════════════════════════════════════════════════════════
+   TEAM VIEW — leaderboard cards + per-setter tabs
+   ══════════════════════════════════════════════════════════════ */
+.team-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.team-tab {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 8px 14px; border-radius: 12px; cursor: pointer;
+  border: 1px solid var(--line); background: transparent;
+  color: var(--txt-2); font-weight: 650; font-size: 13px; font-family: inherit;
+  transition: border-color .18s ease, color .18s ease, background .18s ease;
+}
+.team-tab:hover { border-color: var(--brand); color: var(--txt-1); }
+.team-tab.active { border-color: var(--brand); color: var(--brand); background: rgba(56,189,248,.09); }
+.team-tab .t-count {
+  font-size: 10.5px; font-weight: 700; padding: 1px 7px; border-radius: 8px;
+  background: var(--line); color: var(--txt-2);
+}
+.team-tab.active .t-count { background: rgba(56,189,248,.16); color: var(--brand); }
+.member-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(235px, 1fr)); gap: 12px; }
+.member-card {
+  display: block; width: 100%; text-align: left; padding: 14px;
+  border-radius: 16px; cursor: pointer; border: 1px solid var(--line);
+  background: var(--card-bg, rgba(255,255,255,.03)); color: var(--txt-1); font-family: inherit;
+  transition: border-color .18s ease, transform .18s ease, box-shadow .18s ease;
+}
+.member-card:hover {
+  border-color: var(--brand); transform: translateY(-2px);
+  box-shadow: 0 10px 30px -18px rgba(0,0,0,.6);
+}
+.m-stat {
+  font-size: 11px; color: var(--txt-3); background: var(--line);
+  padding: 3px 8px; border-radius: 8px; white-space: nowrap;
+}
+.m-stat b { color: var(--txt-1); }

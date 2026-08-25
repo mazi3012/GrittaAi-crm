@@ -32,6 +32,7 @@ let AUTH_REQUIRED = false;
 let FILTER = { status: "", setter: "", q: "" };
 let SORT = { key: "updated", dir: -1 };
 let VIEW = "overview";
+let TEAM_TAB = "";  // Team view: "" = leaderboard tab, otherwise a setter name
 let TIMER = null, PAUSED = false, LAST_ERR_TOAST = 0;
 
 const $ = (id) => document.getElementById(id);
@@ -317,6 +318,112 @@ function drawCharts(byStatus) {
   }
 }
 
+
+/* ============================================================
+   RENDER — team view (leaderboard tabs + per-setter lead cards)
+   ============================================================ */
+function renderTeam() {
+  const el = $("view-team");
+  const setters = collectSetters().filter(s => s !== "Unassigned");
+  if (!setters.length) {
+    el.innerHTML = `
+    <div class="glass empty-wrap fade-in">
+      <span class="empty-ico">👥</span>
+      <h3 style="margin:0 0 6px;font-size:17px;">No setters yet</h3>
+      <p style="color:var(--txt-3);font-size:13px;max-width:340px;margin:0;">
+        Add leads with <b>/addlead</b> in Telegram — setters appear here automatically.</p>
+    </div>`;
+    return;
+  }
+
+  const bySetter = {};
+  for (const l of LEADS) {
+    const s = l.sender_name || "Unassigned";
+    if (!bySetter[s]) bySetter[s] = [];
+    bySetter[s].push(l);
+  }
+
+  // Build tabs
+  const tabHtml = setters.map(name => {
+    const leads = bySetter[name] || [];
+    const won = leads.filter(x => x.status === "Won").length;
+    const warm = leads.filter(x => CLOSER.has(x.status) && x.status !== "Won").length;
+    const active = TEAM_TAB === name ? "active" : "";
+    return `<button class="team-tab ${active}" data-team-tab="${esc(name)}">
+      ${esc(name)} <span class="t-count">${leads.length}</span>
+      <span class="t-count" style="background:rgba(52,211,153,.12);color:#34d399;">🏆${won}</span>
+      <span class="t-count" style="background:rgba(251,191,36,.12);color:#fbbf24;">🔥${warm}</span>
+    </button>`;
+  }).join("");
+  const allTab = `<button class="team-tab ${!TEAM_TAB ? "active" : ""}" data-team-tab="">All <span class="t-count">${LEADS.length}</span></button>`;
+
+  if (!TEAM_TAB) {
+    // Leaderboard tab
+    el.innerHTML = `
+    <div class="glass fade-in" style="padding:18px;">
+      <div style="font-weight:750;font-size:15px;margin-bottom:4px;">Team Overview</div>
+      <div style="font-size:11.5px;color:var(--txt-3);margin-bottom:13px;">Click a setter to see their leads</div>
+      <div class="team-tabs">${allTab}${tabHtml}</div>
+      <div class="member-grid">
+        ${setters.map(name => {
+          const leads = bySetter[name] || [];
+          const won = leads.filter(x => x.status === "Won").length;
+          const warm = leads.filter(x => CLOSER.has(x.status) && x.status !== "Won").length;
+          const numbers = leads.filter(x => x.number_received === "Yes").length;
+          const replied = leads.filter(x => x.replied === "Yes").length;
+          const nextTps = leads.filter(x => x.next_touchpoint).length;
+          return `
+          <button class="member-card" data-goto="team" data-team-tab="${esc(name)}">
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+              <span class="avatar" style="width:36px;height:36px;font-size:13px;background:${avColor(name)}">${esc(initials(name))}</span>
+              <div>
+                <div style="font-weight:700;font-size:14px;">${esc(name)}</div>
+                <div style="font-size:11px;color:var(--txt-3);">${leads.length} leads</div>
+              </div>
+            </div>
+            <div style="display:flex;flex-wrap:wrap;gap:6px;">
+              <span class="m-stat">🏆 <b>${won}</b></span>
+              <span class="m-stat">🔥 <b>${warm}</b></span>
+              <span class="m-stat">☎️ <b>${numbers}</b></span>
+              <span class="m-stat">💬 <b>${replied}</b></span>
+              <span class="m-stat">📅 <b>${nextTps}</b></span>
+            </div>
+          </button>`;
+        }).join("")}
+      </div>
+    </div>`;
+  } else {
+    // Single setter's leads
+    const leads = sortRows(bySetter[TEAM_TAB] || []);
+    const backBtn = `<button class="team-tab" data-team-tab="" style="margin-bottom:14px;">← Back to leaderboard</button>`;
+    el.innerHTML = `
+    <div class="glass fade-in" style="padding:18px;">
+      ${backBtn}
+      <div class="member-grid">
+        ${leads.length ? leads.map(l => `
+        <button class="member-card lead-row" data-user="${esc(l.user_name)}" style="text-align:left;">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+            <span class="avatar" style="width:32px;height:32px;font-size:11px;background:${avColor(l.user_name)}">${esc(initials(l.full_name || l.user_name))}</span>
+            <div style="flex:1;min-width:0;">
+              <div style="font-weight:650;font-size:13px;">${esc(l.full_name || l.user_name)} <span class="mono" style="opacity:.5;font-size:11px;">#${l.lead_number}</span></div>
+              <a class="mono" href="${esc(l.profile_link || "#")}" target="_blank" rel="noopener" style="font-size:11px;color:var(--brand);text-decoration:none;">${esc(l.user_name)}</a>
+            </div>
+          </div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;">
+            ${statusChip(l.status)}
+            ${setterPill(l.sender_name)}
+            ${fuProgress(l)}
+            ${l.number_received === "Yes" ? `<span class="m-stat">☎️</span>` : ""}
+            ${l.replied === "Yes" ? `<span class="m-stat">💬</span>` : ""}
+            ${l.next_touchpoint ? `<span class="m-stat mono" style="font-size:10.5px;background:rgba(56,189,248,.12);color:var(--brand);">📅 ${esc(l.next_touchpoint)}</span>` : ""}
+          </div>
+        </button>`).join("") : `
+        <div class="chart-empty" style="grid-column:1/-1;">No leads for ${esc(TEAM_TAB)} yet</div>`}
+      </div>
+    </div>`;
+  }
+}
+
 function renderLeaderboard() {
   const el = $("lbBody");
   if (!el) return;
@@ -521,6 +628,17 @@ function renderDrawer(l) {
   </div>
 
   <div class="drawer-section">
+    <div class="drawer-label">Details</div>
+    <label style="font-size:12px;color:var(--txt-3);display:block;margin-bottom:4px;">Full name</label>
+    <input id="fullNameInput" class="inline-edit" value="${esc(l.full_name || "")}" placeholder="Prospect's real name"/>
+    <label style="font-size:12px;color:var(--txt-3);display:block;margin:9px 0 4px;">Followers count</label>
+    <input id="followersInput" class="inline-edit mono" value="${esc(l.followers_count || "")}" placeholder="e.g. 12.5k"/>
+    <div style="display:flex;justify-content:flex-end;margin-top:8px;">
+      <button id="saveDetailsBtn" class="mini-btn" style="border-color:rgba(52,211,153,.4);color:var(--brand);">💾 Save details</button>
+    </div>
+  </div>
+
+  <div class="drawer-section">
     <div class="drawer-label">Progress flags</div>
     <div style="display:flex;flex-wrap:wrap;gap:7px;">
       ${flagBtn(l, "replied", "Replied")}
@@ -714,15 +832,19 @@ function togglePause() {
 }
 function render() {
   if (VIEW === "overview") renderOverview();
+  else if (VIEW === "team") renderTeam();
   else if (VIEW === "leads") renderLeads();
   else if (VIEW === "board") renderBoard();
   else if (VIEW === "access") renderAccess();
 }
 function switchView(v) {
   VIEW = v;
-  document.querySelectorAll(".view").forEach(x => x.classList.remove("active"));
+  document.querySelectorAll(".view").forEach(x => {
+    x.classList.remove("active");
+    x.style.display = "none";       // inline fallback so stale styles can't win
+  });
   const target = $(`view-${v}`);
-  if (target) target.classList.add("active");
+  if (target) { target.classList.add("active"); target.style.display = "block"; }
   document.querySelectorAll(".nav-btn").forEach(b =>
     b.classList.toggle("active", b.dataset.view === v));
   history.replaceState(null, "", `#${v}`);
@@ -731,7 +853,7 @@ function switchView(v) {
 }
 function viewFromHash() {
   const v = location.hash.replace("#", "");
-  return ["overview", "leads", "board", "access"].includes(v) ? v : "overview";
+  return ["overview", "team", "leads", "board", "access"].includes(v) ? v : "overview";
 }
 
 /* ---------- command palette ---------- */
@@ -739,7 +861,7 @@ function openCmdk() { $("cmdk").classList.add("show"); $("cmdkInput").value = ""
 function closeCmdk() { $("cmdk").classList.remove("show"); }
 function buildCmdk(q) {
   q = q.trim().toLowerCase();
-  const views = [["overview", "📊 Overview"], ["leads", "🗂 Leads table"],
+  const views = [["overview", "📊 Overview"], ["team", "👥 Team"], ["leads", "🗂 Leads table"],
                  ["board", "📌 Board"], ["access", "🔐 Bot access"]]
     .filter(([v]) => !q || v.includes(q) );
   const leads = LEADS.filter(l => !q || `${l.user_name} ${l.full_name}`.toLowerCase().includes(q))
@@ -786,6 +908,16 @@ function wireDrawerEvents() {
       await load({ silent: true }); openDrawer(DRAWER_USER);
     } catch (err) { toast(err.message, "err"); }
   }));
+  body.querySelector("#saveDetailsBtn").addEventListener("click", async () => {
+    try {
+      await api("/api/lead/update", { method: "POST", body: {
+        username: DRAWER_USER,
+        full_name: $("fullNameInput").value.trim(),
+        followers_count: $("followersInput").value.trim(),
+      } });
+      toast("Details saved"); await load({ silent: true }); openDrawer(DRAWER_USER);
+    } catch (err) { toast(err.message, "err"); }
+  });
   body.querySelector("#saveNumBtn").addEventListener("click", async () => {
     try {
       await api("/api/lead/update", { method: "POST", body: { username: DRAWER_USER, number: $("numInput").value.trim(), number_received: $("numInput").value.trim() ? "Yes" : "" } });
@@ -846,10 +978,20 @@ function wireEvents() {
     window.__qT = setTimeout(render, 180);
   });
   $("hamburger").addEventListener("click", () => $("sidebar").classList.toggle("open"));
-  document.querySelectorAll(".sidebar .nav-btn, .logo").forEach(el =>
+  // Auto-close the mobile sidebar whenever a nav destination is picked.
+  // NOTE: #sidebar is an ID, not a class — the old ".sidebar .nav-btn"
+  // selector matched nothing, which is why the menu never closed itself.
+  document.querySelectorAll("#sidebar .nav-btn").forEach(el =>
     el.addEventListener("click", () => { if (window.innerWidth <= 900) $("sidebar").classList.remove("open"); }));
 
   document.addEventListener("click", async (e) => {
+    const ttab = e.target.closest("[data-team-tab]");
+    if (ttab) {
+      TEAM_TAB = ttab.dataset.teamTab || "";
+      renderTeam();
+      if (window.innerWidth <= 900) $("sidebar").classList.remove("open");
+      return;
+    }
     const open = e.target.closest(".open-lead, .lead-row");
     if (open) { openDrawer(open.dataset.open || open.dataset.user); return; }
     const frow = e.target.closest(".funnel-row");

@@ -28,6 +28,7 @@
 
     <nav class="nav-group">
       <button class="nav-btn active" data-view="overview"><span class="ico">📊</span> Overview</button>
+      <button class="nav-btn" data-view="team"><span class="ico">👥</span> Team</button>
       <button class="nav-btn" data-view="board"><span class="ico">🗂</span> Pipeline Board</button>
       <button class="nav-btn" data-view="leads"><span class="ico">📋</span> All Leads</button>
       <button class="nav-btn" data-view="access"><span class="ico">🛡</span> Bot Access</button>
@@ -69,12 +70,13 @@
       </div>
     </header>
 
-    <!-- VIEWS -->
+    <!-- VIEWS (visibility driven by .view / .view.active in styles.css) -->
     <main class="view-container">
-      <section id="view-overview" class="view"></section>
-      <section id="view-board" class="view" style="display:none;"></section>
-      <section id="view-leads" class="view" style="display:none;"></section>
-      <section id="view-access" class="view" style="display:none;"></section>
+      <section id="view-overview" class="view active"></section>
+      <section id="view-team" class="view"></section>
+      <section id="view-board" class="view"></section>
+      <section id="view-leads" class="view"></section>
+      <section id="view-access" class="view"></section>
     </main>
   </div>
 </div>
