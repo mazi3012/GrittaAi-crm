@@ -15,9 +15,10 @@ A Telegram bot that turns chat screenshots into structured CRM leads, paired wit
 ## 🚀 Key Features
 
 1. **Screenshot Triage**: Send a conversation screenshot; PaddleOCR extracts text and OpenRouter AI scores lead quality, intent, and recommended next steps.
-2. **Auto-Claiming & Duplicate Protection**: Auto-claims leads based on the sender, preventing team collisions (`/claim @user` and `/check @user`).
+2. **Sheet-shaped CRM & Duplicate Protection**: leads are logged per-setter (`/addlead @user`, `/lead @user`) with the same 27 columns as the team Google Sheet — duplicates merge into one row, never stolen.
 3. **Interactive Telegram Menu**: Full app-style inline keyboard UI for pipeline management directly inside Telegram.
 4. **Next-Gen CRM Dashboard**: FastAPI SPA with live lead status toggling, dual theme (Obsidian Dark / Slate Light), search/filters, and real-time statistics.
+5. **Google Sheets Backup Mirror**: The whole `leads` table auto-syncs to a public team Google Sheet after every change (`/syncsheet` forces it on demand) — zero extra dependencies.
 
 ---
 
@@ -42,6 +43,29 @@ python bot.py
 # Terminal 2 — Run CRM Dashboard
 uvicorn dashboard:app --host 0.0.0.0 --port 8000
 ```
+
+---
+
+## 📊 Google Sheets Backup (live mirror for the team)
+
+The bot can clone your entire `leads` table into a public Google Sheet so teammates can browse/report without touching Telegram or the dashboard. Every lead mutation (from the **bot or the dashboard**) triggers a debounced background push of the full snapshot, so the sheet can never drift out of sync.
+
+### One-time setup (~3 minutes)
+
+1. Open your team Google Sheet → **Extensions → Apps Script**.
+2. Paste the contents of [`google-apps-script.gs`](google-apps-script.gs), and set the `SECRET` constant to any long random string.
+3. **Deploy → New deployment → Web app** with *Execute as: Me* and *Who has access: Anyone* (the shared secret is what actually blocks strangers). Authorize when prompted.
+4. Copy the Web app URL ending in `/exec`.
+5. Add to your environment (local `.env`, Render/HF Spaces secrets):
+
+   ```env
+   GOOGLE_SHEET_WEBAPP_URL=https://script.google.com/macros/s/AKfy.../exec
+   GOOGLE_SHEET_SECRET=your-long-random-string
+   ```
+
+6. Run `/syncsheet` in Telegram to verify — the `Leads` tab fills instantly, and every sync is logged in a `Sync Log` tab.
+
+> 💡 The sheet is a **mirror**: the CRM database stays the source of truth, and each sync overwrites manual sheet edits. If a dashboard-side change happens while Vercel's serverless worker is frozen, the next bot-side change (or `/syncsheet`) catches it up. Leave `GOOGLE_SHEET_WEBAPP_URL` empty to disable the feature entirely — everything then behaves exactly as before.
 
 ---
 
@@ -92,6 +116,8 @@ uvicorn dashboard:app --host 0.0.0.0 --port 8000
 | `bot.py` | Telegram bot: Vision AI analysis → interactive inline menus + HF health server |
 | `dashboard.py` | FastAPI web dashboard serving static SPA and REST endpoints |
 | `db.py` | Shared SQLite data layer with WAL mode support |
+| `sheets.py` | Google Sheets backup mirror — debounced full-snapshot pushes |
+| `google-apps-script.gs` | Paste into your Google Sheet's Apps Script editor (one-time setup) |
 | `static/` | Next-Gen SPA dashboard (HTML, CSS, JS with Obsidian/Slate theme support) |
 | `Dockerfile` | Docker configuration for Hugging Face Spaces / Render deployment |
 | `render.yaml` | Render Blueprint for one-click Telegram bot deployment |
@@ -117,6 +143,8 @@ uvicorn dashboard:app --host 0.0.0.0 --port 8000
 | `ADMIN_SESSION_SECRET` | Optional cookie-signing secret; rotating signs out all sessions | falls back to `ADMIN_PASSWORD` |
 | `ALLOWED_TELEGRAM_IDS` | Comma-separated numeric Telegram IDs allowed to use the bot. Empty both lists = bot open to everyone (still fully logged). | — |
 | `ALLOWED_TELEGRAM_USERNAMES` | Comma-separated @handles allowed to use the bot | — |
+| `GOOGLE_SHEET_WEBAPP_URL` | Apps Script Web App `/exec` URL — enables the live Google Sheets backup mirror ([setup guide](#-google-sheets-backup-live-mirror-for-the-team)) | — |
+| `GOOGLE_SHEET_SECRET` | Shared secret; must match the `SECRET` constant in the Apps Script | — |
 
 > ⚠️ Never commit `.env` to version control. Keep secrets in your environment settings on Hugging Face and Vercel.
 
@@ -124,9 +152,11 @@ uvicorn dashboard:app --host 0.0.0.0 --port 8000
 
 ## 🔒 Pipeline Rules & Access Control
 
-**Lead lifecycle:** `New → Contacted → Meeting Booked → Active Client`, plus `Lost`.
-- A **converted deal becomes an Active Client** (shown solid green everywhere). The stage is **locked**: nobody can drag it back to New/Contacted — from Telegram *or* the dashboard. The only exit is an explicit **🚫 Cancel Deal** when a client quits the service.
-- **Cancelled clients** can be ♻️ re-activated (moved back to Active Client) if they return.
+**Lead lifecycle (mirrors the Google Sheet Status column):**
+`Message Sent → Seen Not Replied → Replied → Follow up 1-4 → Replied-No yet booked → Number received → Closing Call → Discovery Call booked → Won`, plus `Not Interested` / `Lost`.
+
+- Every write stamps **Last Touchpoint**; marking a follow-up auto-dates it and saving a number flips **Number Received ✓** — same rules the sheet's dropdowns imply.
+- The dashboard board/table, the Telegram cards and the Google Sheet mirror all share these exact values, so nothing drifts between them.
 - Guardrails live once in `db.STAGE_TRANSITIONS` and are enforced by the DB layer itself — the UI merely mirrors them.
 
 **Dashboard auth:** set `ADMIN_PASSWORD` (e.g. in Vercel env vars) and the whole API requires signing in at the glass login screen. Sessions are stateless signed cookies (7 days) — no database needed, works across serverless cold starts. Sign out anytime from the sidebar.

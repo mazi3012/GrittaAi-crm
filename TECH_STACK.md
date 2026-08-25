@@ -12,7 +12,7 @@
 
 ```
  Telegram (@GrittaAi_bot)
-    │  photo + optional caption          /claim  /check  /start
+    │  photo + optional caption    /addlead /lead /leads /stats /fup /next
     ▼
  bot.py ── pyTelegramBotAPI long-polling (auto-reconnect loop)
     │  1. download photo via Bot API
@@ -64,18 +64,26 @@
 | `.env` / `.env.example` | — | `TELEGRAM_TOKEN`, `OPENROUTER_API_KEY`, optional `MODEL` |
 | `requirements.txt` | 12 | pinned direct dependencies |
 
-## 4. Data model (`crm.db` → `leads`)
+## 4. Data model (`crm.db` → `leads` — mirrors the team Google Sheet, 27 columns)
 
-| Column | Type | Notes |
-|---|---|---|
-| `username` | TEXT PK | normalized: trimmed, lowercased, leading `@` |
-| `claimed_by` | TEXT | first owner kept forever (no lead stealing) |
-| `status` | TEXT | New / Contacted / Meeting Booked / Converted / Lost |
-| `lead_score` | TEXT | HIGH / MEDIUM / LOW / UNKNOWN (LLM-assigned) |
-| `platform` | TEXT | Instagram / WhatsApp / IndiaMART |
-| `next_steps` | TEXT | actionable instruction from the LLM |
-| `conversation_summary` | TEXT | appended per analysis, capped 500 chars |
-| `last_updated` | TIMESTAMP | auto on every write |
+| Column | Notes |
+|---|---|
+| `user_name` | TEXT PK — normalized: trimmed, lowercased, leading `@` |
+| `lead_number` | auto-increments **per setter** (each member has their own tab numbering) |
+| `full_name` / `profile_link` / `followers_count` | identity columns; link is auto-built from the handle |
+| `sender_name` / `sender_profile` | the setter who owns the lead (reassignable) |
+| `first_touchpoint` / `last_touchpoint` | date stamps; every write bumps Last Touchpoint |
+| `note` | free-text context, appended by `/note` and the AI analyzer |
+| `status` | Message Sent → … → Won (+ Not Interested / Lost) — same values as the sheet dropdown |
+| `next_touchpoint` | next follow-up date (`/next @user friday`) |
+| `replied` / `number_received` / `number` | Yes/No flags; a saved number flips Number Received ✓ |
+| `follow_up_1..4` (+`_date`) | flag = Yes auto-stamps that day's date |
+| `discovery_call` / `discovery_date` / `closing_call_status` / `closed_result` | closer columns; closing status is an enum |
+| `updated_at` | TIMESTAMP, auto on every write |
+
+Legacy screenshot-triage rows are auto-migrated on startup into this schema
+(`leads_legacy` keeps the originals); the Google Sheet mirror (`sheets.py`)
+pushes exactly these columns to the team spreadsheet.
 
 ## 5. Key engineering decisions
 

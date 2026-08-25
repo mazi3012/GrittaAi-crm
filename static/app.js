@@ -1,35 +1,35 @@
 /* ============================================================
    Gretta CRM — app.js
-   Vanilla JS SPA · polls the FastAPI backend · zero build step
+   Vanilla JS SPA · mirrors the team Google Sheet columns
+   (Lead Number … Closed Won/Lost) · polls FastAPI · no build step
    ============================================================ */
 "use strict";
 
-/* ---------- constants ---------- */
-const STAGES = ["New", "Contacted", "Meeting Booked", "Converted", "Cancelled", "Lost"];
-const SCORES = ["HIGH", "MEDIUM", "LOW", "UNKNOWN"];
-/* Customer-facing names: a CONVERTED deal is an ACTIVE CLIENT of the service */
-const STAGE_LABEL = { "Converted": "Active Client" };
-const disp = (st) => STAGE_LABEL[st] || st;
-/* Pipeline guardrails — mirror of db.STAGE_TRANSITIONS, keep them in sync!
-   An Active Client can ONLY be cancelled; a Cancelled client can only be
-   re-activated. Nobody can drag a won client back into prospecting. */
-const TRANSITIONS = {
-  "New": ["Contacted", "Meeting Booked", "Converted", "Lost"],
-  "Contacted": ["New", "Meeting Booked", "Converted", "Lost"],
-  "Meeting Booked": ["New", "Contacted", "Converted", "Lost"],
-  "Converted": ["Cancelled"],
-  "Cancelled": ["Converted"],
-  "Lost": ["New", "Contacted", "Meeting Booked", "Converted"],
-};
-const allowedTargets = (status) => TRANSITIONS[status || "New"] || [];
-const SDOT = { "New": "#94a3b8", "Contacted": "#38bdf8", "Meeting Booked": "#a78bfa", "Converted": "#34d399", "Cancelled": "#fb923c", "Lost": "#f87171" };
-const SCOL = { HIGH: "#34d399", MEDIUM: "#fbbf24", LOW: "#f87171", UNKNOWN: "#64748b" };
-const SKEY = { "New": "New", "Contacted": "Contacted", "Meeting Booked": "MB", "Converted": "Converted", "Cancelled": "Cancelled", "Lost": "Lost" };
+/* ---------- constants : the 14 outreach statuses of the sheet ---------- */
+const STATUSES = ["Message Sent", "Seen Not Replied", "Replied",
+  "Follow up 1", "Follow up 2", "Follow up 3", "Follow up 4",
+  "Replied-No yet booked", "Closing Call", "Number received",
+  "Discovery Call booked", "Not Interested", "Lost", "Won"];
+const EMOJI = { "Message Sent": "📨", "Seen Not Replied": "👀", "Replied": "💬",
+  "Follow up 1": "1️⃣", "Follow up 2": "2️⃣", "Follow up 3": "3️⃣", "Follow up 4": "4️⃣",
+  "Replied-No yet booked": "🤔", "Closing Call": "📞", "Number received": "☎️",
+  "Discovery Call booked": "📅", "Not Interested": "🚫", "Lost": "❌", "Won": "🏆" };
+const SCOL = { "Message Sent": "#94a3b8", "Seen Not Replied": "#64748b",
+  "Replied": "#38bdf8", "Follow up 1": "#818cf8", "Follow up 2": "#a78bfa",
+  "Follow up 3": "#c084fc", "Follow up 4": "#e879f9", "Replied-No yet booked": "#fbbf24",
+  "Closing Call": "#fb923c", "Number received": "#2dd4bf",
+  "Discovery Call booked": "#60a5fa", "Not Interested": "#f87171",
+  "Lost": "#ef4444", "Won": "#34d399" };
+const CLOSER = new Set(["Replied", "Replied-No yet booked", "Number received",
+  "Closing Call", "Discovery Call booked", "Won"]);
+const CLOSING_OPTS = ["Interested", "Not Interested", "No Response", "Scheduled",
+  "Completed", "Rescheduled", "No Show"];
+const disp = (s) => `${EMOJI[s] || "▫️"} ${s}`;
 
 /* ---------- state ---------- */
-let LEADS = [], STATS = {}, OWNERS = [], USERS = [];
+let LEADS = [], STATS = {}, USERS = [];
 let AUTH_REQUIRED = false;
-let FILTER = { stage: "", score: "", owner: "", q: "" };
+let FILTER = { status: "", setter: "", q: "" };
 let SORT = { key: "updated", dir: -1 };
 let VIEW = "overview";
 let TIMER = null, PAUSED = false, LAST_ERR_TOAST = 0;
@@ -56,12 +56,11 @@ async function api(path, opts = {}) {
 /* ---------- small ui helpers ---------- */
 function toast(msg, kind = "ok") {
   const box = document.createElement("div");
-  box.className = `toast ${kind}`;
+  box.className = `toast ${kind === "ok" ? "" : kind}`;
   box.innerHTML = `<span>${kind === "ok" ? "✅" : "⚠️"}</span><span>${esc(msg)}</span>`;
   $("toasts").appendChild(box);
   setTimeout(() => { box.classList.add("out"); setTimeout(() => box.remove(), 260); }, 3000);
 }
-
 function initials(name) {
   const s = String(name || "?").replace(/[@^_\-.0-9]/g, "").trim();
   return (s ? s.slice(0, 2) : "?").toUpperCase();
@@ -80,74 +79,83 @@ function timeAgo(s) {
   if (m < 60) return `${m}m ago`;
   const h = Math.floor(m / 60);
   if (h < 24) return `${h}h ago`;
-  const days = Math.floor(h / 24);
-  if (days < 30) return `${days}d ago`;
-  return `${Math.floor(days / 30)}mo ago`;
+  return `${Math.floor(h / 24)}d ago`;
 }
 function animateNum(el, to) {
   if (!el) return;
-  const t0 = performance.now(), dur = 650;
-  const step = (t) => {
-    const p = Math.min(1, (t - t0) / dur), e = 1 - Math.pow(1 - p, 3);
-    el.textContent = Math.round(to * e);
+  const from = parseInt(el.textContent.replace(/\D/g, "")) || 0;
+  if (from === to) { el.textContent = to; return; }
+  const t0 = performance.now(), dur = 500;
+  requestAnimationFrame(function step(t) {
+    const p = Math.min((t - t0) / dur, 1);
+    el.textContent = Math.round(from + (to - from) * (1 - Math.pow(1 - p, 3)));
     if (p < 1) requestAnimationFrame(step);
-  };
-  requestAnimationFrame(step);
+  });
 }
-
-/* ---------- chips & pills ---------- */
-function scoreChip(sc) { return `<span class="chip score-${esc(sc)}">${esc(sc)}</span>`; }
-function stageChip(st) { return `<span class="chip stage-${SKEY[st] || "New"}">${esc(st)}</span>`; }
-function ownerPill(owner) {
-  if (!owner) return `<span class="unclaimed-pill">◌ Unclaimed</span>`;
-  return `<span class="owner-pill"><span class="avatar" style="background:${avColor(owner)}">${esc(initials(owner))}</span>${esc(owner)}</span>`;
+function statusChip(st) {
+  return `<span class="chip" style="background:${SCOL[st] || "#64748b"}22;color:${SCOL[st] || "#94a3b8"};border:1px solid ${SCOL[st] || "#94a3b8"}55;">${esc(disp(st))}</span>`;
 }
-function cardAccent(score) { return score === "HIGH" ? "hot" : score === "MEDIUM" ? "warm" : "cold"; }
+function setterPill(name) {
+  return `<span class="chip owner"><span class="avatar" style="width:16px;height:16px;font-size:8.5px;background:${avColor(name)}">${esc(initials(name))}</span>${esc(name || "Unassigned")}</span>`;
+}
+function fuProgress(l) {
+  let done = 0;
+  for (const n of [1, 2, 3, 4]) if (l[`follow_up_${n}`] === "Yes") done++;
+  return `<span class="mono" style="font-size:11px;color:var(--txt-3);">🔁 ${done}/4</span>`;
+}
 
 /* ---------- filtering / sorting ---------- */
 function applyFilters(rows) {
   const q = FILTER.q.trim().toLowerCase();
-  return rows.filter(r =>
-    (!FILTER.stage || r.status === FILTER.stage) &&
-    (!FILTER.score || r.score === FILTER.score) &&
-    (!FILTER.owner || (r.claimed_by || "") === FILTER.owner) &&
-    (!q || (r.username + " " + (r.claimed_by || "") + " " + r.summary + " " + r.next_steps).toLowerCase().includes(q))
-  );
-}
-function sortRows(rows) {
-  const k = SORT.key;
-  return [...rows].sort((a, b) => {
-    let va, vb;
-    if (k === "updated") { va = ts(a); vb = ts(b); }
-    else if (k === "username" || k === "claimed_by" || k === "platform") { va = a[k] || ""; vb = b[k] || ""; }
-    else { va = a[k] || ""; vb = b[k] || ""; }
-    if (k === "score") { va = SCORES.indexOf(a.score); vb = SCORES.indexOf(b.score); }
-    if (typeof va === "string") return va.localeCompare(vb) * SORT.dir;
-    return (va - vb) * SORT.dir;
+  return rows.filter(l => {
+    if (FILTER.status && l.status !== FILTER.status) return false;
+    if (FILTER.setter && (l.sender_name || "Unassigned") !== FILTER.setter) return false;
+    if (q) {
+      const hay = `${l.user_name} ${l.full_name} ${l.note} ${l.number} ${l.sender_name}`.toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
   });
 }
-function collectOwners() {
-  OWNERS = [...new Set(LEADS.map(l => l.claimed_by).filter(Boolean))].sort();
-  return OWNERS;
+function sortRows(rows) {
+  const k = SORT.key, d = SORT.dir;
+  return [...rows].sort((a, b) => {
+    let va, vb;
+    if (k === "updated") { return (ts(a) - ts(b)) * d; }
+    if (k === "lead_number") { va = a.sender_name + String(a.lead_number).padStart(5, "0"); vb = b.sender_name + String(b.lead_number).padStart(5, "0"); return va.localeCompare(vb) * d; }
+    va = String(a[k] ?? "").toLowerCase(); vb = String(b[k] ?? "").toLowerCase();
+    return va.localeCompare(vb) * d;
+  });
 }
+function collectSetters() {
+  const set = new Set();
+  for (const l of LEADS) set.add(l.sender_name || "Unassigned");
+  return [...set].sort();
+}
+
 /* ============================================================
-   RENDER — overview (KPIs + pipeline funnel)
+   RENDER — overview (KPIs · funnel · charts · leaderboard)
    ============================================================ */
 function renderOverview() {
   const el = $("view-overview");
   if (!LEADS.length) {
-    el.innerHTML = `<div class="glass empty-wrap fade-in">
+    el.innerHTML = `
+    <div class="glass empty-wrap fade-in">
       <span class="empty-ico">🪄</span>
       <h3 style="margin:0 0 6px;font-size:17px;">No leads yet</h3>
       <p style="color:var(--txt-3);font-size:13px;max-width:340px;margin:0;">
-        Send a screenshot to <b>@GrittaAi_bot</b> in Telegram and watch leads appear here live.</p>
+        Use <b>/addlead</b> in Telegram or <b>/importsheet</b> to pull your Google Sheet — leads appear here live.</p>
     </div>`;
     $("healthBar").style.width = "0%";
     $("healthPct").textContent = "0%";
     return;
   }
 
-  const s = STATS;
+  const byStatus = STATS.by_status || {};
+  const sum = (keys) => keys.reduce((acc, k) => acc + (byStatus[k] || 0), 0);
+  const numbersIn = LEADS.filter(l => l.number_received === "Yes").length;
+  const repliedN = LEADS.filter(l => l.replied === "Yes").length;
+
   const kpi = (id, label, icon, tint, glow) =>
     `<div class="glass kpi" style="--kpi-tint:${tint};--kpi-glow:${glow};padding:16px 18px;">
        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;">
@@ -160,26 +168,27 @@ function renderOverview() {
   el.innerHTML = `
   <div class="stagger" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:13px;margin-bottom:14px;">
     ${kpi("kTotal", "Total Leads", "👥", "rgba(52,211,153,.14)", "rgba(52,211,153,.35)")}
-    ${kpi("kHot", "Hot Leads", "🔥", "rgba(251,191,36,.14)", "rgba(251,191,36,.35)")}
-    ${kpi("kConv", "Active Clients", "🏆", "rgba(52,211,153,.18)", "rgba(52,211,153,.45)")}
-    ${kpi("kMeet", "Meetings Booked", "📅", "rgba(56,189,248,.14)", "rgba(56,189,248,.35)")}
-    ${kpi("kCanc", "Cancelled", "🚫", "rgba(251,146,60,.14)", "rgba(251,146,60,.32)")}
-    ${kpi("kUncl", "Unclaimed", "◌", "rgba(248,113,113,.13)", "rgba(248,113,113,.3)")}
+    ${kpi("kWarm", "Warm Leads", "🔥", "rgba(251,191,36,.14)", "rgba(251,191,36,.35)")}
+    ${kpi("kWon", "Closed Won", "🏆", "rgba(52,211,153,.18)", "rgba(52,211,153,.45)")}
+    ${kpi("kNum", "Numbers In", "☎️", "rgba(45,212,191,.14)", "rgba(45,212,191,.35)")}
+    ${kpi("kRep", "Replied", "💬", "rgba(56,189,248,.14)", "rgba(56,189,248,.35)")}
+    ${kpi("kDead", "NI / Lost", "🚫", "rgba(248,113,113,.13)", "rgba(248,113,113,.3)")}
   </div>
 
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:14px;">
     <!-- FUNNEL -->
     <div class="glass fade-in" style="padding:18px;min-width:0;">
       <div style="font-weight:750;font-size:15px;margin-bottom:4px;">Pipeline Funnel</div>
-      <div style="font-size:11.5px;color:var(--txt-3);margin-bottom:14px;">Click a stage to filter everywhere · click again to clear</div>
-      ${STAGES.map(st => {
-        const counts = STAGES.map(x => LEADS.filter(l => l.status === x).length);
-        const n = counts[STAGES.indexOf(st)];
-        const w = Math.max(n ? (n / Math.max(...counts, 1)) * 100 : 2, 2);
-        return `<div class="funnel-row ${FILTER.stage === st ? "sel" : ""}" data-fstage="${esc(st)}">
-          <span style="font-size:12.5px;font-weight:650;color:${SDOT[st]};display:flex;align-items:center;gap:7px;">
-            <span style="width:8px;height:8px;border-radius:99px;background:${SDOT[st]};"></span>${esc(disp(st))}</span>
-          <div class="funnel-track"><div class="funnel-fill" style="width:${w}%;background:linear-gradient(90deg,${SDOT[st]}55,${SDOT[st]});"></div></div>
+      <div style="font-size:11.5px;color:var(--txt-3);margin-bottom:14px;">Click a status to filter everywhere · click again to clear</div>
+      ${STATUSES.map(st => {
+        const n = byStatus[st] || 0;
+        const max = Math.max(...STATUSES.map(x => byStatus[x] || 0), 1);
+        const w = Math.max(n ? (n / max) * 100 : 2, 2);
+        const c = SCOL[st];
+        return `<div class="funnel-row ${FILTER.status === st ? "sel" : ""}" data-fstatus="${esc(st)}">
+          <span style="font-size:12.5px;font-weight:650;color:${c};display:flex;align-items:center;gap:7px;white-space:nowrap;">
+            <span style="width:8px;height:8px;border-radius:99px;background:${c};"></span>${esc(disp(st))}</span>
+          <div class="funnel-track"><div class="funnel-fill" style="width:${w}%;background:linear-gradient(90deg,${c}55,${c});"></div></div>
           <b class="mono" style="text-align:right;color:var(--txt-2);">${n}</b>
         </div>`;
       }).join("")}
@@ -188,7 +197,7 @@ function renderOverview() {
     <!-- CHARTS -->
     <div style="display:flex;flex-direction:column;gap:14px;min-width:0;">
       <div class="glass fade-in" style="padding:18px;">
-        <div style="font-weight:750;font-size:15px;margin-bottom:11px;">Intent Score Mix</div>
+        <div style="font-weight:750;font-size:15px;margin-bottom:11px;">Pipeline Mix</div>
         <div class="chart-box" style="height:172px;"><canvas id="donutCv"></canvas></div>
       </div>
       <div class="glass fade-in" style="padding:18px;">
@@ -199,29 +208,29 @@ function renderOverview() {
 
     <!-- LEADERBOARD -->
     <div class="glass fade-in" style="padding:18px;">
-      <div style="font-weight:750;font-size:15px;margin-bottom:4px;">Team Leaderboard</div>
-      <div style="font-size:11.5px;color:var(--txt-3);margin-bottom:13px;">Ranked by closed-won, then total owned</div>
+      <div style="font-weight:750;font-size:15px;margin-bottom:4px;">Setter Leaderboard</div>
+      <div style="font-size:11.5px;color:var(--txt-3);margin-bottom:13px;">Ranked by closed-won, then total logged</div>
       <div id="lbBody"></div>
     </div>
   </div>`;
 
-  animateNum($("kTotal"), s.total);
-  animateNum($("kHot"), s.hot);
-  animateNum($("kConv"), s.converted);
-  animateNum($("kMeet"), s.meetings);
-  animateNum($("kCanc"), s.cancelled || 0);
-  animateNum($("kUncl"), s.unclaimed);
+  animateNum($("kTotal"), STATS.total || 0);
+  animateNum($("kWarm"), STATS.warm || sum([...CLOSER].filter(s => s !== "Won")));
+  animateNum($("kWon"), byStatus["Won"] || 0);
+  animateNum($("kNum"), numbersIn);
+  animateNum($("kRep"), repliedN);
+  animateNum($("kDead"), (byStatus["Not Interested"] || 0) + (byStatus["Lost"] || 0));
 
-  const engaged = LEADS.filter(l => l.status !== "New").length;
+  const engaged = LEADS.filter(l => l.status !== "Message Sent").length;
   const pct = LEADS.length ? Math.round((engaged / LEADS.length) * 100) : 0;
   $("healthBar").style.width = pct + "%";
   $("healthPct").textContent = pct + "%";
 
   renderLeaderboard();
-  drawCharts();
+  drawCharts(byStatus);
 }
 /* ============================================================
-   RENDER — charts + team leaderboard
+   RENDER — charts + setter leaderboard
    ============================================================ */
 let CHARTS = {};
 function chartTheme() {
@@ -233,23 +242,32 @@ function chartTheme() {
     grid: light ? "rgba(19,26,38,.08)" : "rgba(148,163,184,.06)",
   };
 }
-function drawCharts() {
+function drawCharts(byStatus) {
   if (!window.Chart) return;
   const T = chartTheme();
+  byStatus = byStatus || STATS.by_status || {};
 
-  /* donut: intent score mix */
-  const scoreCounts = SCORES.map(sc => LEADS.filter(l => l.score === sc).length);
+  /* donut: pipeline mix grouped into funnel phases */
+  const groups = [
+    { label: "Outreach", keys: ["Message Sent", "Seen Not Replied", "Follow up 1", "Follow up 2", "Follow up 3", "Follow up 4"], color: "#94a3b8" },
+    { label: "Replied", keys: ["Replied", "Replied-No yet booked"], color: "#38bdf8" },
+    { label: "Closing", keys: ["Number received", "Closing Call"], color: "#fb923c" },
+    { label: "Discovery", keys: ["Discovery Call booked"], color: "#60a5fa" },
+    { label: "Won", keys: ["Won"], color: "#34d399" },
+    { label: "Dead", keys: ["Not Interested", "Lost"], color: "#f87171" },
+  ];
+  const counts = groups.map(g => g.keys.reduce((a, k) => a + (byStatus[k] || 0), 0));
   const dEl = $("donutCv");
   if (CHARTS.donut) { CHARTS.donut.destroy(); delete CHARTS.donut; }
   if (dEl) {
-    if (!scoreCounts.some(n => n > 0)) {
-      dEl.replaceWith(Object.assign(dEl.cloneNode(false), { outerHTML: `<div class="chart-empty">No scored leads yet</div>` }));
+    if (!counts.some(n => n > 0)) {
+      dEl.replaceWith(Object.assign(dEl.cloneNode(false), { outerHTML: `<div class="chart-empty">No leads yet</div>` }));
     } else {
       CHARTS.donut = new Chart(dEl.getContext("2d"), {
         type: "doughnut",
         data: {
-          labels: ["High", "Medium", "Low", "Unknown"],
-          datasets: [{ data: scoreCounts, backgroundColor: [SCOL.HIGH, SCOL.MEDIUM, SCOL.LOW, SCOL.UNKNOWN], borderColor: T.border, borderWidth: 3, hoverOffset: 8 }],
+          labels: groups.map(g => g.label),
+          datasets: [{ data: counts, backgroundColor: groups.map(g => g.color), borderColor: T.border, borderWidth: 3, hoverOffset: 8 }],
         },
         options: {
           maintainAspectRatio: false, cutout: "68%",
@@ -259,14 +277,15 @@ function drawCharts() {
     }
   }
 
-  /* line: last-14-day activity from summary timestamps */
+  /* line: last-14-day activity from Last Touchpoint */
   const days = [];
   for (let i = 13; i >= 0; i--) {
     const d = new Date(Date.now() - i * 86400000);
     days.push({ key: d.toISOString().slice(0, 10), label: `${d.getDate()}/${d.getMonth() + 1}`, n: 0 });
   }
-  for (const l of LEADS) for (const t of extractTimes(l.summary)) {
-    const k = new Date(t).toISOString().slice(0, 10);
+  for (const l of LEADS) {
+    if (!l.last_touchpoint) continue;
+    const k = String(l.last_touchpoint);
     const day = days.find(x => x.key === k);
     if (day) day.n++;
   }
@@ -282,117 +301,115 @@ function drawCharts() {
         labels: days.map(d => d.label),
         datasets: [{
           data: days.map(d => d.n), borderColor: "#34d399", borderWidth: 2.2,
-          fill: true, backgroundColor: grad, tension: .38,
+          fill: true, backgroundColor: grad, tension: .35,
           pointRadius: 2.5, pointBackgroundColor: "#34d399",
         }],
       },
       options: {
         maintainAspectRatio: false,
-        plugins: { legend: { display: false } },
         scales: {
-          x: { grid: { display: false }, ticks: { color: T.tick, font: { size: 10 } } },
-          y: { beginAtZero: true, grid: { color: T.grid }, ticks: { color: T.tick, font: { size: 10 }, precision: 0 } },
+          x: { ticks: { color: T.tick, font: { family: "Inter", size: 10 } }, grid: { display: false } },
+          y: { beginAtZero: true, ticks: { color: T.tick, precision: 0, font: { family: "Inter", size: 10 } }, grid: { color: T.grid } },
         },
+        plugins: { legend: { display: false } },
       },
     });
   }
 }
 
 function renderLeaderboard() {
-  const byOwner = {};
-  for (const l of LEADS) {
-    if (!l.claimed_by) continue;
-    byOwner[l.claimed_by] = byOwner[l.claimed_by] || { total: 0, won: 0, hot: 0 };
-    const o = byOwner[l.claimed_by];
-    o.total++;
-    if (l.status === "Converted") o.won++;
-    if (l.score === "HIGH") o.hot++;
-  }
-  const rows = Object.entries(byOwner).map(([name, v]) => ({ name, ...v }))
-    .sort((a, b) => b.won - a.won || b.total - a.total);
-
-  const box = $("lbBody");
-  if (!rows.length) { box.innerHTML = `<div style="color:var(--txt-3);font-size:12.5px;padding:18px 0;text-align:center;">No claimed leads yet — claim one from the bot!</div>`; return; }
-
-  const max = Math.max(...rows.map(r => r.total), 1);
-  box.innerHTML = rows.map((r, i) => `
-    <div class="funnel-row" data-fowner="${esc(r.name)}" style="grid-template-columns:34px 1fr 118px 44px;gap:10px;padding:7px 8px;">
-      <span class="lb-rank r${i + 1}">${i + 1}</span>
-      <div style="min-width:0;">
-        <div style="font-weight:700;font-size:13px;display:flex;align-items:center;gap:8px;"><span class="avatar" style="background:${avColor(r.name)}">${esc(initials(r.name))}</span>${esc(r.name)}</div>
-        <div class="bar-mini" style="margin-top:6px;"><div style="width:${Math.round((r.total / max) * 100)}%"></div></div>
+  const el = $("lbBody");
+  if (!el) return;
+  const setters = Object.entries(STATS.setters || {});
+  if (!setters.length) { el.innerHTML = `<div class="chart-empty">No setters yet</div>`; return; }
+  setters.sort((a, b) => ((b[1].by_status?.["Won"] || 0) - (a[1].by_status?.["Won"] || 0)) || (b[1].total - a[1].total));
+  const max = Math.max(...setters.map(([, s]) => s.total), 1);
+  el.innerHTML = setters.map(([name, s], i) => {
+    const won = s.by_status?.["Won"] || 0;
+    const warm = [...CLOSER].reduce((a, k) => a + (s.by_status?.[k] || 0), 0);
+    const medal = ["🥇", "🥈", "🥉"][i] || `#${i + 1}`;
+    return `
+    <div style="display:flex;align-items:center;gap:9px;padding:7px 4px;border-bottom:1px solid var(--line);">
+      <span style="font-size:13px;width:26px;">${medal}</span>
+      <span class="avatar" style="width:26px;height:26px;font-size:10px;background:${avColor(name)}">${esc(initials(name))}</span>
+      <div style="flex:1;min-width:0;">
+        <div style="display:flex;justify-content:space-between;font-size:12.5px;font-weight:650;">
+          <span>${esc(name)}</span>
+          <span class="mono" style="color:var(--txt-2);">${s.total} · 🏆${won} · 🔥${warm}</span>
+        </div>
+        <div class="funnel-track" style="margin-top:5px;">
+          <div class="funnel-fill" style="width:${Math.max((s.total / max) * 100, 3)}%;background:linear-gradient(90deg,#34d39955,#34d399);"></div>
+        </div>
       </div>
-      <div style="text-align:right;font-size:11.5px;color:var(--txt-3);line-height:1.5;">
-        <b style="color:#6ee7b7;">${r.won} won</b> · ${r.total} owned<br/><span style="color:#fcd34d;">${r.hot} hot</span>
-      </div>
-      <button class="mini-btn" data-fowner-btn="${esc(r.name)}" title="Filter by this owner">→</button>
-    </div>`).join("");
+    </div>`;
+  }).join("");
 }
+
 /* ============================================================
-   RENDER — kanban board (drag & drop)
+   RENDER — kanban board (one column per status)
    ============================================================ */
 function renderBoard() {
   const el = $("view-board");
   const rows = applyFilters(LEADS);
-  el.innerHTML = `<div class="board" style="height:100%;">` + STAGES.map(st => {
+  el.innerHTML = `<div class="board" style="height:100%;">` + STATUSES.map(st => {
     const cards = sortRows(rows.filter(r => r.status === st));
     return `
-    <div class="kanban-col glass" data-stage="${esc(st)}">
-      <div class="col-head">
-        <span class="col-dot" style="background:${SDOT[st]};box-shadow:0 0 12px ${SDOT[st]}66;"></span>
-        <span style="font-weight:750;font-size:13px;color:${SDOT[st]};">${esc(disp(st))}</span>
-        <span class="col-count mono">${cards.length}</span>
+    <div class="board-col" data-stage="${esc(st)}">
+      <div class="board-head" style="color:${SCOL[st]};">
+        ${esc(disp(st))}
+        <span class="mono board-count">${cards.length}</span>
       </div>
-      <div class="col-cards" data-drop="${esc(st)}">
-        ${cards.map(cardHtml).join("")}
-        ${cards.length ? "" : `<div style="border:1.5px dashed rgba(148,163,184,.13);border-radius:13px;padding:22px 10px;text-align:center;color:var(--txt-3);font-size:11.5px;">Drop leads here</div>`}
+      <div class="board-cards" data-stage-drop="${esc(st)}">
+        ${cards.map(cardHtml).join("") || `<div class="board-empty">—</div>`}
       </div>
     </div>`;
   }).join("") + `</div>`;
+  wireDragAndDrop();
 }
 
 function cardHtml(l) {
+  const name = l.full_name || l.user_name;
   return `
-  <article class="lead-card fade-in ${cardAccent(l.score)}" draggable="true" data-user="${esc(l.username)}">
+  <article class="lead-card fade-in" draggable="true" data-user="${esc(l.user_name)}">
     <div class="card-user">
-      <span class="avatar" style="width:28px;height:28px;font-size:11px;background:${avColor(l.username)}">${esc(initials(l.username))}</span>
+      <span class="avatar" style="width:28px;height:28px;font-size:11px;background:${avColor(l.user_name)}">${esc(initials(name))}</span>
       <div style="min-width:0;">
-        <div class="card-name">${esc(l.username)}</div>
-        <div class="card-sub">on ${esc(l.platform)}</div>
+        <div class="card-name"><span class="mono" style="opacity:.6;font-size:10.5px;">#${l.lead_number}</span> ${esc(name)}</div>
+        <div class="card-sub mono">${esc(l.user_name)}${l.followers_count ? ` · 👥 ${esc(l.followers_count)}` : ""}</div>
       </div>
     </div>
-    <div style="display:flex;gap:6px;margin-top:9px;align-items:center;">${scoreChip(l.score)}${ownerPill(l.claimed_by)}</div>
-    ${l.next_steps && l.next_steps !== "Review lead details" ? `<div class="card-next"><span>🎯</span><span>${esc(l.next_steps)}</span></div>` : ""}
+    <div style="display:flex;gap:6px;margin-top:9px;align-items:center;flex-wrap:wrap;">
+      ${setterPill(l.sender_name)}${fuProgress(l)}
+      ${l.number_received === "Yes" ? `<span title="number received">☎️</span>` : ""}
+      ${l.next_touchpoint ? `<span class="mono" style="font-size:10.5px;color:var(--txt-3);">📅 ${esc(l.next_touchpoint)}</span>` : ""}
+    </div>
     <div class="card-foot">
       <span style="font-size:10.5px;color:var(--txt-3);font-weight:600;">🕒 ${timeAgo(l.updated)}</span>
-      <button class="mini-btn open-lead" data-open="${esc(l.username)}" style="padding:4px 9px;font-size:11.5px;">Open →</button>
+      <button class="mini-btn open-lead" data-open="${esc(l.user_name)}" style="padding:4px 9px;font-size:11.5px;">Open →</button>
     </div>
   </article>`;
 }
+
 /* ============================================================
    RENDER — leads table (sortable)
    ============================================================ */
 function renderLeads() {
   const el = $("view-leads");
-  const owners = collectOwners();
+  const owners = collectSetters();
   const rows = sortRows(applyFilters(LEADS));
   const arrow = (k) => SORT.key === k ? `<span class="arr">${SORT.dir > 0 ? "▲" : "▼"}</span>` : "";
 
   el.innerHTML = `
   <div class="glass fade-in" style="padding:14px;margin-bottom:12px;display:flex;flex-wrap:wrap;gap:9px;align-items:center;">
     <select id="fStage" class="fsel">
-      <option value="">All stages</option>
-      ${STAGES.map(s => `<option value="${esc(s)}" ${FILTER.stage === s ? "selected" : ""}>${esc(disp(s))}</option>`).join("")}
-    </select>
-    <select id="fScore" class="fsel">
-      <option value="">All scores</option>
-      ${SCORES.map(s => `<option ${FILTER.score === s ? "selected" : ""}>${s}</option>`).join("")}
+      <option value="">All statuses</option>
+      ${STATUSES.map(s => `<option value="${esc(s)}" ${FILTER.status === s ? "selected" : ""}>${esc(disp(s))}</option>`).join("")}
     </select>
     <select id="fOwner" class="fsel">
-      <option value="">All owners</option>
-      ${owners.map(o => `<option ${FILTER.owner === o ? "selected" : ""}>${esc(o)}</option>`).join("")}
+      <option value="">All setters</option>
+      ${owners.map(o => `<option ${FILTER.setter === o ? "selected" : ""}>${esc(o)}</option>`).join("")}
     </select>
-    ${(FILTER.stage || FILTER.score || FILTER.owner || FILTER.q) ? `<button id="clearBtn" class="mini-btn">✕ Clear filters</button>` : ""}
+    ${(FILTER.status || FILTER.setter || FILTER.q) ? `<button id="clearBtn" class="mini-btn">✕ Clear filters</button>` : ""}
     <span class="result-count" style="margin-left:auto;"><b>${rows.length}</b> of ${LEADS.length} leads</span>
   </div>
 
@@ -400,18 +417,19 @@ function renderLeads() {
     <div style="overflow-x:auto;max-height:calc(100vh - 250px);overflow-y:auto;">
       <table class="tbl">
         <thead><tr>
-          <th data-sort="username">Lead ${arrow("username")}</th>
-          <th data-sort="status">Stage ${arrow("status")}</th>
-          <th data-sort="score">Intent ${arrow("score")}</th>
-          <th data-sort="claimed_by">Owner ${arrow("claimed_by")}</th>
-          <th data-sort="platform">Source ${arrow("platform")}</th>
-          <th>Next step</th>
-          <th>Summary</th>
+          <th style="width:44px;">#</th>
+          <th data-sort="full_name">Lead ${arrow("full_name")}</th>
+          <th data-sort="status">Status ${arrow("status")}</th>
+          <th data-sort="sender_name">Setter ${arrow("sender_name")}</th>
+          <th data-sort="followers_count">Followers</th>
+          <th>Phone</th>
+          <th>FU</th>
+          <th data-sort="next_touchpoint">Next TP ${arrow("next_touchpoint")}</th>
           <th data-sort="updated">Updated ${arrow("updated")}</th>
         </tr></thead>
         <tbody>
           ${rows.length ? rows.map(rowHtml).join("") : `
-          <tr><td colspan="8"><div class="empty-wrap" style="padding:44px 16px;">
+          <tr><td colspan="9"><div class="empty-wrap" style="padding:44px 16px;">
             <span class="empty-ico" style="font-size:34px;">🔍</span>
             <div style="font-weight:700;">No leads match your filters</div>
             <div style="color:var(--txt-3);font-size:12.5px;margin-top:4px;">Try clearing a filter or changing your search.</div>
@@ -420,458 +438,403 @@ function renderLeads() {
       </table>
     </div>
   </div>`;
+  wireTableEvents();
 }
 
 function rowHtml(l) {
+  const name = l.full_name || l.user_name;
   return `
-  <tr data-user="${esc(l.username)}">
-    <td><div class="cell-user">
-      <span class="avatar" style="background:${avColor(l.username)}">${esc(initials(l.username))}</span>
-      <div><div>${esc(l.username)}</div><div style="font-size:10.5px;color:var(--txt-3);font-weight:600;">on ${esc(l.platform)}</div></div>
-    </div></td>
-    <td>${stageChip(l.status)}</td>
-    <td>${scoreChip(l.score)}</td>
-    <td>${ownerPill(l.claimed_by)}</td>
-    <td style="color:#a5b4fc;font-size:12px;font-weight:650;">${esc(l.platform)}</td>
-    <td style="max-width:190px;"><div class="cell-sum" style="max-width:190px;color:#d8cfa2;" title="${esc(l.next_steps)}">${esc(l.next_steps)}</div></td>
-    <td><div class="cell-sum" title="${esc(l.summary)}">${esc(l.summary) || "—"}</div></td>
-    <td style="white-space:nowrap;color:var(--txt-3);font-size:11.5px;" title="${esc(l.updated)}">${timeAgo(l.updated)}</td>
+  <tr class="lead-row" data-user="${esc(l.user_name)}">
+    <td class="mono" style="color:var(--txt-3);">${l.lead_number}</td>
+    <td>
+      <div style="display:flex;align-items:center;gap:8px;min-width:170px;">
+        <span class="avatar" style="width:24px;height:24px;font-size:9.5px;background:${avColor(l.user_name)}">${esc(initials(name))}</span>
+        <div style="min-width:0;">
+          <div style="font-weight:650;font-size:13px;">${esc(name)}</div>
+          <a class="mono" href="${esc(l.profile_link || "#")}" target="_blank" rel="noopener" style="font-size:11px;color:var(--brand);text-decoration:none;">${esc(l.user_name)}</a>
+        </div>
+      </div>
+    </td>
+    <td>${statusChip(l.status)}</td>
+    <td>${setterPill(l.sender_name)}</td>
+    <td class="mono" style="color:var(--txt-2);">${esc(l.followers_count || "—")}</td>
+    <td class="mono" style="font-size:12px;">${l.number ? esc(l.number) : `<span style="opacity:.35;">—</span>`}${l.replied === "Yes" ? ` <span title="replied">💬</span>` : ""}</td>
+    <td>${fuProgress(l)}</td>
+    <td class="mono" style="font-size:12px;color:${l.next_touchpoint ? "var(--brand)" : "var(--txt-3)"};">${esc(l.next_touchpoint || "—")}</td>
+    <td style="font-size:11.5px;color:var(--txt-3);white-space:nowrap;">${timeAgo(l.updated)}</td>
   </tr>`;
 }
 /* ============================================================
-   LEAD DRAWER — detail panel
+   DRAWER — full lead record (all sheet columns)
    ============================================================ */
 let DRAWER_USER = null;
 
 function openDrawer(username) {
-  const l = LEADS.find(x => x.username === username);
-  if (!l) { toast("Lead no longer exists", "err"); return; }
-  DRAWER_USER = username;
+  const l = LEADS.find(x => x.user_name === username || x.username === username);
+  if (!l) { toast("Lead not found", "err"); return; }
+  DRAWER_USER = l.user_name;
   renderDrawer(l);
   $("drawer").classList.add("open");
   $("backdrop").classList.add("show");
 }
-
 function closeDrawer() {
   $("drawer").classList.remove("open");
   $("backdrop").classList.remove("show");
   DRAWER_USER = null;
 }
 
-function renderDrawer(l) {
-  const times = extractTimes(l.summary);
-  const entries = times.map(t => ({ t, text: textBefore(l.summary, t) }));
-  entries.reverse(); // newest first
-  const tintByScore = { HIGH: "rgba(52,211,153,.16)", MEDIUM: "rgba(251,191,36,.15)", LOW: "rgba(248,113,113,.14)", UNKNOWN: "rgba(148,163,184,.12)" };
-  const handle = l.username.replace(/^@/, "");
-  const isIG = /insta/i.test(l.platform);
-  const profileUrl = isIG ? `https://instagram.com/${handle}` : `https://x.com/${handle}`;
-
-  $("drawerBody").innerHTML = `
-    <div class="drawer-hero" style="--hero-tint:${tintByScore[l.score] || tintByScore.UNKNOWN};">
-      <button class="icon-btn" id="closeDrawerBtn" style="position:absolute;top:16px;right:16px;padding:0;width:34px;">✕</button>
-      <div style="display:flex;gap:14px;align-items:center;">
-        <div class="drawer-big-avatar" style="background:linear-gradient(135deg,${avColor(l.username)},${avColor(handle)});">${esc(initials(l.username))}</div>
-        <div style="min-width:0;">
-          <h2 style="margin:0;font-size:19px;letter-spacing:-.01em;">${esc(l.username)}</h2>
-          <div style="display:flex;gap:7px;margin-top:7px;">${stageChip(l.status)}${scoreChip(l.score)}</div>
-        </div>
-      </div>
-      <div style="display:flex;gap:8px;margin-top:15px;">
-        <a class="mini-btn" href="${profileUrl}" target="_blank" rel="noopener">${isIG ? "📸 Instagram" : "𝕏 Profile"} ↗</a>
-        <a class="mini-btn" href="https://t.me/${handle}" target="_blank" rel="noopener">✈️ Telegram ↗</a>
-        <button class="mini-btn" id="copyHandleBtn">⧉ Copy</button>
-      </div>
-    </div>
-
-    <div class="drawer-section">
-      <div class="drawer-label">Move to stage</div>
-      ${l.status === "Converted" ? `
-      <div class="lock-note">🔒 <b>Active Client</b> is locked — the only change possible is cancelling the deal.</div>
-      <div class="stage-jump">
-        <button class="cur" disabled>🏆 Active Client ✓</button>
-        <button class="danger-jump" data-stage-jump="Cancelled">🚫 Cancel Deal</button>
-      </div>` : l.status === "Cancelled" ? `
-      <div class="lock-note">🚫 This client cancelled and left the service.</div>
-      <div class="stage-jump">
-        <button class="cur" disabled>🚫 Cancelled ✓</button>
-        <button data-stage-jump="Converted">♻️ Re-activate (Active Client)</button>
-      </div>` : `
-      <div class="stage-jump">
-        <button class="cur" disabled>${esc(disp(l.status))} ✓</button>
-        ${allowedTargets(l.status).map(st => `<button data-stage-jump="${esc(st)}">${st === "Converted" ? "🏆 Active Client" : esc(disp(st))}</button>`).join("")}
-      </div>`}
-    </div>
-
-    <div class="drawer-section">
-      <div class="drawer-label">Owner</div>
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-        ${ownerPill(l.claimed_by)}
-        <select id="reassignSel" class="fsel">
-          <option value="">— Reassign to —</option>
-          ${collectOwners().filter(o => o !== l.claimed_by).map(o => `<option>${esc(o)}</option>`).join("")}
-          <option value="__new__">New teammate…</option>
-        </select>
-      </div>
-      <div id="newOwnerRow" style="display:none;margin-top:9px;gap:8px;">
-        <input id="newOwnerInput" class="inline-edit" placeholder="e.g. @gretta_sales" style="flex:1;"/>
-        <button id="saveOwnerBtn" class="mini-btn" style="border-color:rgba(52,211,153,.4);color:var(--brand);">Save</button>
-      </div>
-    </div>
-
-    <div class="drawer-section">
-      <div class="drawer-label">Next step</div>
-      <input id="nextStepInput" class="inline-edit" value="${esc(l.next_steps)}"/>
-      <div style="display:flex;justify-content:flex-end;margin-top:9px;">
-        <button id="saveNextBtn" class="mini-btn" style="border-color:rgba(52,211,153,.4);color:var(--brand);">💾 Save next step</button>
-      </div>
-    </div>
-
-    <div class="drawer-section">
-      <div class="drawer-label">Add a note (appended to AI summary)</div>
-      <textarea id="noteText" class="note-input" rows="2" placeholder="Called them, wants pricing by Friday…"></textarea>
-      <div style="display:flex;justify-content:flex-end;margin-top:9px;">
-        <button id="saveNoteBtn" class="icon-btn primary" style="height:32px;">＋ Add note</button>
-      </div>
-    </div>
-
-    <div class="drawer-section">
-      <div class="drawer-label">Edit lead</div>
-      <div class="edit-grid">
-        <label>Stage
-          <select id="editStatus">${[...new Set([l.status, ...allowedTargets(l.status)])].map(st => `<option value="${esc(st)}" ${l.status === st ? "selected" : ""}>${st === "Converted" ? "🏆 Active Client" : esc(disp(st))}</option>`).join("")}</select>
-        </label>
-        <label>Intent score
-          <select id="editScore">${["HIGH", "MEDIUM", "LOW", "UNKNOWN"].map(sc => `<option ${l.score === sc ? "selected" : ""}>${sc}</option>`).join("")}</select>
-        </label>
-        <label>Platform
-          <input id="editPlatform" value="${esc(l.platform)}"/>
-        </label>
-        <label>Owner
-          <input id="editOwner" value="${esc(l.claimed_by || "")}" placeholder="empty = unclaimed"/>
-        </label>
-      </div>
-      <label style="margin-top:10px;">Next step
-        <input id="editNextSteps" value="${esc(l.next_steps)}"/>
-      </label>
-      <label style="margin-top:10px;">Conversation summary
-        <textarea id="editSummary" rows="4">${esc(l.summary)}</textarea>
-      </label>
-      <div style="display:flex;justify-content:flex-end;margin-top:11px;">
-        <button id="saveEditBtn" class="mini-btn" style="border-color:rgba(52,211,153,.4);color:var(--brand);padding:7px 14px;">💾 Save changes</button>
-      </div>
-    </div>
-
-    <div class="drawer-section" style="border-bottom:none;">
-      <div style="display:flex;justify-content:space-between;align-items:center;">
-        <span style="font-size:11px;color:var(--txt-3);font-weight:600;">Deletes the row and all its history.</span>
-        <button class="danger-btn" id="deleteLeadBtn">🗑 Delete this lead permanently</button>
-      </div>
-    </div>
-
-
-    <div class="drawer-section" style="border-bottom:none;">
-      <div class="drawer-label">Activity timeline · ${times.length} update${times.length === 1 ? "" : "s"}</div>
-      <div class="tl">
-        ${entries.length ? entries.map((e, i) => `
-          <div class="tl-item ${i > 0 ? "old" : ""}">
-            <span class="tl-dot"></span>
-            <div class="tl-time mono">${new Date(e.t).toLocaleString()}</div>
-            <div class="tl-body">${esc(e.text) || "<i>update</i>"}</div>
-          </div>`).join("")
-      : `<div style="color:var(--txt-3);font-size:12.5px;">No timestamped history yet.</div>`}
-      </div>
-    </div>`;
+function flagBtn(l, field, label) {
+  const on = l[field] === "Yes";
+  return `<button class="mini-btn ${on ? "flag-on" : ""}" data-flag="${field}"
+    style="${on ? "border-color:rgba(52,211,153,.55);color:var(--brand);background:rgba(52,211,153,.08);" : ""}padding:5px 10px;font-size:11.5px;">${on ? "✓" : "○"} ${label}</button>`;
 }
-/* ============================================================
-   CSV EXPORT
-   ============================================================ */
+
+function renderDrawer(l) {
+  const fu = [1, 2, 3, 4].map(n => flagBtn(l, `follow_up_${n}`, `FU${n}`)).join("");
+  $("drawerBody").innerHTML = `
+  <div style="display:flex;align-items:center;gap:11px;margin-bottom:14px;">
+    <span class="avatar" style="width:44px;height:44px;font-size:15px;background:${avColor(l.user_name)}">${esc(initials(l.full_name || l.user_name))}</span>
+    <div style="min-width:0;flex:1;">
+      <div style="font-weight:750;font-size:16px;display:flex;gap:8px;align-items:center;">
+        <span class="mono" style="opacity:.55;font-size:12px;">#${l.lead_number}</span>${esc(l.full_name || l.user_name)}
+      </div>
+      <button class="copy-handle mono" data-copy="${esc(l.user_name)}" style="background:none;border:none;color:var(--brand);font-size:12.5px;cursor:pointer;padding:0;">${esc(l.user_name)} ⧉</button>
+    </div>
+    <button id="drawerClose" class="icon-btn">✕</button>
+  </div>
+
+  <div class="drawer-section">
+    ${statusChip(l.status)}
+    <select id="statusSelect" class="fsel" style="margin-top:9px;width:100%;">
+      ${STATUSES.map(s => `<option value="${esc(s)}" ${l.status === s ? "selected" : ""}>${esc(disp(s))}</option>`).join("")}
+    </select>
+  </div>
+
+  <div class="drawer-section">
+    <div class="drawer-label">Contact</div>
+    <div style="display:flex;flex-direction:column;gap:6px;font-size:12.5px;color:var(--txt-2);">
+      ${l.profile_link ? `<a href="${esc(l.profile_link)}" target="_blank" rel="noopener" style="color:var(--brand);text-decoration:none;">🔗 ${esc(l.profile_link)}</a>` : ""}
+      <span>👥 Followers: <b>${esc(l.followers_count || "—")}</b></span>
+      <span>🧑‍💼 Setter: ${setterPill(l.sender_name)}</span>
+      <span>🕒 1st: <b>${esc(l.first_touchpoint || "—")}</b> · last: <b>${esc(l.last_touchpoint || "—")}</b></span>
+    </div>
+  </div>
+
+  <div class="drawer-section">
+    <div class="drawer-label">Progress flags</div>
+    <div style="display:flex;flex-wrap:wrap;gap:7px;">
+      ${flagBtn(l, "replied", "Replied")}
+      ${flagBtn(l, "number_received", "Number ✓")}
+      ${fu}
+      ${flagBtn(l, "discovery_call", "Discovery")}
+    </div>
+  </div>
+
+  <div class="drawer-section">
+    <div class="drawer-label">Phone number</div>
+    <input id="numInput" class="inline-edit mono" value="${esc(l.number || "")}" placeholder="e.g. +91 98765 43210"/>
+    <div style="display:flex;justify-content:flex-end;margin-top:8px;">
+      <button id="saveNumBtn" class="mini-btn" style="border-color:rgba(52,211,153,.4);color:var(--brand);">💾 Save number</button>
+    </div>
+  </div>
+
+  <div class="drawer-section">
+    <div class="drawer-label">Dates</div>
+    <label style="font-size:12px;color:var(--txt-3);display:block;margin-bottom:4px;">Next touchpoint</label>
+    <input id="nextTpInput" type="date" class="inline-edit mono" value="${esc(l.next_touchpoint || "")}"/>
+    <label style="font-size:12px;color:var(--txt-3);display:block;margin:9px 0 4px;">Discovery date</label>
+    <input id="discDateInput" type="date" class="inline-edit mono" value="${esc(l.discovery_date || "")}"/>
+    <div style="display:flex;justify-content:flex-end;margin-top:8px;">
+      <button id="saveDatesBtn" class="mini-btn" style="border-color:rgba(52,211,153,.4);color:var(--brand);">💾 Save dates</button>
+    </div>
+  </div>
+
+  <div class="drawer-section">
+    <div class="drawer-label">Closing</div>
+    <label style="font-size:12px;color:var(--txt-3);display:block;margin-bottom:4px;">Closing call status</label>
+    <select id="closingSelect" class="fsel" style="width:100%;">
+      <option value="" ${!l.closing_call_status ? "selected" : ""}>—</option>
+      ${CLOSING_OPTS.map(o => `<option ${l.closing_call_status === o ? "selected" : ""}>${o}</option>`).join("")}
+    </select>
+    <label style="font-size:12px;color:var(--txt-3);display:block;margin:9px 0 4px;">Closed (Won/Lost)</label>
+    <select id="closedSelect" class="fsel" style="width:100%;">
+      <option value="" ${!l.closed_result ? "selected" : ""}>—</option>
+      <option ${l.closed_result === "Won" ? "selected" : ""}>Won</option>
+      <option ${l.closed_result === "Lost" ? "selected" : ""}>Lost</option>
+    </select>
+  </div>
+
+  <div class="drawer-section">
+    <div class="drawer-label">Note</div>
+    <textarea id="noteArea" class="inline-edit" rows="4" placeholder="Add context about this prospect…">${esc(l.note || "")}</textarea>
+    <div style="display:flex;justify-content:flex-end;margin-top:8px;">
+      <button id="saveNoteBtn" class="mini-btn" style="border-color:rgba(52,211,153,.4);color:var(--brand);">💾 Save note</button>
+    </div>
+  </div>
+
+  <div class="drawer-section">
+    <div class="drawer-label">Reassign setter</div>
+    <select id="ownerSelect" class="fsel" style="width:100%;">
+      <option value="Unassigned" ${(l.sender_name || "Unassigned") === "Unassigned" ? "selected" : ""}>Unassigned</option>
+      ${collectSetters().filter(o => o !== "Unassigned" && o !== l.sender_name).map(o => `<option>${esc(o)}</option>`).join("")}
+      <option value="__new__">New setter…</option>
+    </select>
+    <input id="newOwnerInput" class="inline-edit" placeholder="@new_setter_handle" style="display:none;margin-top:7px;"/>
+  </div>
+
+  <button id="deleteLeadBtn" class="mini-btn" style="width:100%;margin-top:14px;border-color:rgba(248,113,113,.45);color:#f87171;">🗑 Delete this lead</button>`;
+  wireDrawerEvents();
+}
+
+/* ---------- CSV export : exact Google Sheet column order ---------- */
+const SHEET_COLS = [["lead_number", "Lead Number"], ["full_name", "Full Name (Lead)"],
+  ["user_name", "User name (Lead)"], ["profile_link", "Profile Link"],
+  ["followers_count", "Followers Count"], ["sender_name", "Sender Name"],
+  ["sender_profile", "Sender Profile"], ["first_touchpoint", "First Touchpoint (Date)"],
+  ["note", "Note"], ["status", "Status"], ["last_touchpoint", "Last Touchpoint (Date)"],
+  ["next_touchpoint", "Next Touchpoint (Date)"], ["replied", "Replied"],
+  ["number_received", "Number Received"], ["number", "Number"],
+  ["follow_up_1", "Follow up 1"], ["follow_up_1_date", "Follow up 1 (Date)"],
+  ["follow_up_2", "Follow up 2"], ["follow_up_2_date", "Follow up 2 (Date)"],
+  ["follow_up_3", "Follow up 3"], ["follow_up_3_date", "Follow up 3 (Date)"],
+  ["follow_up_4", "Follow up 4"], ["follow_up_4_date", "Follow up 4 (Date)"],
+  ["discovery_call", "Discovery Call"], ["discovery_date", "Discovery Date"],
+  ["closing_call_status", "Closing Call Status"], ["closed_result", "Closed (Won/Lost)"]];
+
 function exportCsv() {
   const rows = sortRows(applyFilters(LEADS));
   if (!rows.length) { toast("Nothing to export with current filters", "err"); return; }
-  const cols = ["username", "status", "score", "claimed_by", "platform", "next_steps", "summary", "updated"];
   const q = (v) => `"${String(v == null ? "" : v).replace(/"/g, '""')}"`;
-  const csv = [cols.join(",")].concat(rows.map(r => cols.map(c => q(r[c])).join(","))).join("\n");
+  const csv = [SHEET_COLS.map(c => q(c[1])).join(",")]
+    .concat(rows.map(r => SHEET_COLS.map(c => q(r[c[0]])).join(","))).join("\n");
   const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
-  a.download = `gretta-leads-${new Date().toISOString().slice(0, 10)}.csv`;
-  a.click();
-  URL.revokeObjectURL(a.href);
+  a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+  a.download = "gretta-crm.csv";
+  a.click(); URL.revokeObjectURL(a.href);
   toast(`Exported ${rows.length} leads`);
 }
 
-/* ============================================================
-   BOT ACCESS VIEW — Telegram user audit & whitelist
-   ============================================================ */
+/* ---------- bot access tab ---------- */
 async function loadUsers() {
-  try {
-    const data = await api("/api/users");
-    USERS = data.users || [];
-    renderAccess();
-  } catch (e) { toast(e.message || "Couldn't load bot users", "err"); }
+  try { USERS = (await api("/api/users")).users || []; }
+  catch { USERS = []; }
+  if (VIEW === "access") renderAccess();
+  updateBotStatus();
 }
-
+function updateBotStatus() {
+  const dot = $("liveDot"), lbl = $("liveLbl"), bs = $("botStatus");
+  if (!lbl) return;
+  lbl.textContent = PAUSED ? "Paused" : "Live";
+  if (dot) dot.style.background = PAUSED ? "#fbbf24" : "#34d399";
+  if (bs) bs.title = `${USERS.length} Telegram users seen`;
+}
 function renderAccess() {
   const el = $("view-access");
-  const rows = [...USERS].sort((a, b) =>
-    (b.authorized - a.authorized) || (b.msg_count - a.msg_count));
   el.innerHTML = `
-  <div class="glass fade-in" style="padding:16px;margin-bottom:12px;">
-    <div style="font-weight:750;font-size:15px;">🛡 Bot Access Control</div>
-    <div style="font-size:12px;color:var(--txt-3);margin-top:4px;max-width:760px;line-height:1.55;">
-      Every Telegram account that ever messaged the bot is logged here —
-      including strangers who were refused. ✅ Allowed users can use Gretta;
-      ⛔ Blocked users were turned away. Hard server-side lockdown: set
-      <code>ALLOWED_TELEGRAM_IDS</code> / <code>ALLOWED_TELEGRAM_USERNAMES</code>
-      on the bot service.</div>
-  </div>
-  <div class="glass" style="overflow:hidden;">
-    <div style="overflow-x:auto;">
-      <table class="tbl">
-        <thead><tr>
-          <th>User</th><th>Name</th><th>Telegram ID</th><th>Status</th>
-          <th>Msgs</th><th>First seen</th><th>Last seen</th><th></th>
-        </tr></thead>
-        <tbody>
-          ${rows.length ? rows.map(u => `
-          <tr>
-            <td style="font-weight:700;">${esc(u.username || "—")}</td>
-            <td>${esc(u.first_name || "—")}</td>
-            <td class="mono" style="font-size:12px;">${esc(u.telegram_id)}</td>
-            <td><span class="chip ${u.authorized ? "u-on" : "u-off"}">${u.authorized ? "✅ Allowed" : "⛔ Blocked"}</span></td>
-            <td class="mono">${u.msg_count}</td>
-            <td style="color:var(--txt-3);font-size:11.5px;">${esc((u.first_seen || "").replace("T", " ").slice(0, 16))}</td>
-            <td style="color:var(--txt-3);font-size:11.5px;">${esc((u.last_seen || "").replace("T", " ").slice(0, 16))}</td>
-            <td><button class="mini-btn" data-uact="${esc(u.telegram_id)}" data-unext="${u.authorized ? "" : "1"}">${u.authorized ? "Deny" : "Allow"}</button></td>
-          </tr>`).join("") : `
-          <tr><td colspan="8"><div class="empty-wrap" style="padding:44px 16px;">
-            <span class="empty-ico" style="font-size:34px;">🛡</span>
-            <div style="font-weight:700;">No bot users yet</div>
-            <div style="color:var(--txt-3);font-size:12.5px;margin-top:4px;">Anyone who messages the bot on Telegram will appear here automatically.</div>
-          </div></td></tr>`}
-        </tbody>
-      </table>
-    </div>
+  <div class="glass fade-in" style="padding:18px;max-width:760px;">
+    <div style="font-weight:750;font-size:15px;margin-bottom:4px;">Bot Access</div>
+    <div style="font-size:11.5px;color:var(--txt-3);margin-bottom:13px;">
+      Every Telegram account that ever messaged the bot. Only whitelisted accounts can use it.</div>
+    ${USERS.length ? USERS.map(u => `
+      <div style="display:flex;align-items:center;gap:10px;padding:9px 2px;border-bottom:1px solid var(--line);">
+        <span class="avatar" style="width:30px;height:30px;font-size:11px;background:${avColor(u.username || u.telegram_id)}">${esc(initials(u.first_name || u.username))}</span>
+        <div style="flex:1;min-width:0;">
+          <div style="font-size:13px;font-weight:650;">${esc(u.first_name || u.username || u.telegram_id)}</div>
+          <div class="mono" style="font-size:11px;color:var(--txt-3);">${esc(u.username || u.telegram_id)} · ${u.msg_count} msgs · last ${timeAgo(u.last_seen)}</div>
+        </div>
+        <button class="mini-btn acc-toggle" data-id="${esc(u.telegram_id)}" data-val="${u.authorized ? "0" : "1"}"
+          style="${u.authorized ? "border-color:rgba(52,211,153,.5);color:var(--brand);" : "color:var(--txt-3);"}">${u.authorized ? "✓ Allowed" : "Blocked"}</button>
+      </div>`).join("") : `<div class="chart-empty">No Telegram users yet</div>`}
   </div>`;
 }
 
-/* ============================================================
-   ADMIN AUTH — login gate / sign out
-   ============================================================ */
-function showLogin() {
-  const gate = $("loginGate");
-  if (!gate) return;
-  gate.style.display = "flex";
-  setTimeout(() => { const p = $("loginPass"); if (p && !p.value) p.focus(); }, 60);
-}
+/* ---------- auth gate ---------- */
+function showLogin() { const g = $("loginGate"); if (g) g.style.display = "flex"; }
 function hideLogin() { const g = $("loginGate"); if (g) g.style.display = "none"; }
-
 async function initAuth() {
-  let auth_required = false, authenticated = true;
   try {
-    const s = await api("/api/auth/status");
-    auth_required = !!s.auth_required;
-    authenticated = !!s.authenticated;
-  } catch {}
-  AUTH_REQUIRED = auth_required;
-  $("logoutBtn").style.display = auth_required ? "" : "none";
-  return !auth_required || authenticated;
+    const st = await api("/api/auth/status");
+    AUTH_REQUIRED = st.auth_required;
+    if (st.auth_required && !st.authenticated) showLogin();
+    else hideLogin();
+    return !(st.auth_required && !st.authenticated);
+  } catch { showLogin(); return false; }
 }
-
 function wireLogin() {
   $("loginForm").addEventListener("submit", async (e) => {
     e.preventDefault();
-    const btn = $("loginSubmitBtn");
-    btn.disabled = true;
+    $("loginErr").textContent = "";
     try {
-      await api("/api/auth/login", { method: "POST", body: {
-        username: $("loginUser").value,
-        password: $("loginPass").value,
-      } });
-      $("loginErr").textContent = "";
-      $("loginPass").value = "";
-      hideLogin();
-      await load();
-      startPolling();
-    } catch (err) {
-      $("loginErr").textContent = err.message || "Sign-in failed";
-    } finally { btn.disabled = false; }
+      await api("/api/auth/login", { method: "POST",
+        body: { username: $("loginUser").value, password: $("loginPass").value } });
+      hideLogin(); await load();
+    } catch (err) { $("loginErr").textContent = err.message; }
   });
   $("logoutBtn").addEventListener("click", async () => {
-    clearInterval(TIMER);
-    try { await api("/api/auth/logout", { method: "POST", body: {} }); } catch {}
-    location.reload();
+    try { await api("/api/auth/logout", { method: "POST" }); } catch {}
+    LEADS = []; STATS = {}; render(); showLogin();
   });
 }
 
-/* ============================================================
-   DATA LOAD + LIVE POLLING
-   ============================================================ */
+/* ---------- data loading / polling ---------- */
 async function load({ silent = false } = {}) {
   try {
     const data = await api("/api/leads");
-    LEADS = data.leads;
-    STATS = data.stats;
-    collectOwners();
+    LEADS = data.leads || [];
+    STATS = data.stats || {};
+    LAST_ERR_TOAST = 0;
     render();
-    $("botStatus").textContent = "● Bot live";
-    $("botStatus").style.color = "var(--brand)";
-  } catch (e) {
-    console.error(e);
-    $("botStatus").textContent = "● Offline";
-    $("botStatus").style.color = "#f87171";
-    if (!silent && Date.now() - LAST_ERR_TOAST > 15000) {
-      toast("Couldn't reach the CRM backend", "err");
+  } catch (err) {
+    if (!silent && Date.now() - LAST_ERR_TOAST > 30000) {
+      toast(`Load failed: ${err.message}`, "err");
       LAST_ERR_TOAST = Date.now();
     }
   }
 }
-
 function startPolling() {
   clearInterval(TIMER);
-  TIMER = setInterval(() => load({ silent: true }), 15000);
+  TIMER = setInterval(() => { if (!PAUSED && !DRAWER_USER) load({ silent: true }); }, 5000);
 }
 
-/* ============================================================
-   THEME (light / dark)
-   ============================================================ */
+/* ---------- theme / pause / render root ---------- */
 function applyTheme(mode) {
   document.documentElement.dataset.theme = mode;
-  $("themeBtn").textContent = mode === "light" ? "🌙 Dark" : "☀️ Light";
-  $("themeBtn").title = mode === "light" ? "Switch to dark mode" : "Switch to light mode";
-  try { localStorage.setItem("gretta_theme", mode); } catch {}
-  drawCharts(); // re-render charts with theme-aware colors
+  localStorage.setItem("gretta-theme", mode);
+  $("themeBtn").textContent = mode === "light" ? "🌙" : "☀️";
 }
-
 function toggleTheme() {
   applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
+  if (VIEW === "overview") renderOverview();
 }
-
 function togglePause() {
   PAUSED = !PAUSED;
-  if (PAUSED) { clearInterval(TIMER); }
-  else startPolling();
-  $("liveDot").classList.toggle("paused", PAUSED);
-  $("liveLbl").textContent = PAUSED ? "Paused" : "Live";
-  $("pauseBtn").innerHTML = PAUSED ? "▶ Resume" : "⏸ Pause";
+  $("pauseBtn").textContent = PAUSED ? "▶️" : "⏸";
+  updateBotStatus();
+  toast(PAUSED ? "Auto-refresh paused" : "Auto-refresh resumed");
 }
-
-/* ============================================================
-   RENDER DISPATCH + VIEW SWITCHING
-   ============================================================ */
 function render() {
   if (VIEW === "overview") renderOverview();
-  else if (VIEW === "board") renderBoard();
   else if (VIEW === "leads") renderLeads();
+  else if (VIEW === "board") renderBoard();
   else if (VIEW === "access") renderAccess();
-
-  document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.view === VIEW));
 }
-
 function switchView(v) {
   VIEW = v;
-  if (location.hash !== `#/${v}`) { location.hash = `#/${v}`; return; } // hashchange re-enters with VIEW set
-  for (const id of ["overview", "board", "leads", "access"]) $(`view-${id}`).style.display = id === v ? "" : "none";
+  document.querySelectorAll(".view").forEach(x => x.classList.remove("active"));
+  const target = $(`view-${v}`);
+  if (target) target.classList.add("active");
+  document.querySelectorAll(".nav-btn").forEach(b =>
+    b.classList.toggle("active", b.dataset.view === v));
+  history.replaceState(null, "", `#${v}`);
   render();
   if (v === "access") loadUsers();
-  $("sidebar").classList.remove("open"); // close mobile drawer after nav
 }
-
 function viewFromHash() {
-  const h = location.hash.replace(/^#\/?/, "");
-  return ["overview", "board", "leads", "access"].includes(h) ? h : "overview";
+  const v = location.hash.replace("#", "");
+  return ["overview", "leads", "board", "access"].includes(v) ? v : "overview";
 }
-/* ============================================================
-   COMMAND PALETTE (⌘/Ctrl+K)
-   ============================================================ */
-let CMDK_ITEMS = [];
-function openCmdk() {
-  $("cmdk").classList.add("show");
-  const inp = $("cmdkInput");
-  inp.value = "";
-  buildCmdk("");
-  inp.focus();
-}
-function closeCmdk() { $("cmdk").classList.remove("show"); }
 
+/* ---------- command palette ---------- */
+function openCmdk() { $("cmdk").classList.add("show"); $("cmdkInput").value = ""; buildCmdk(""); $("cmdkInput").focus(); }
+function closeCmdk() { $("cmdk").classList.remove("show"); }
 function buildCmdk(q) {
   q = q.trim().toLowerCase();
-  const VIEWS_META = [
-  ["overview", "📊", "Overview"],
-  ["board", "🗂", "Pipeline Board"],
-  ["leads", "📋", "All Leads"],
-  ["access", "🛡", "Bot Access"],
-];
-CMDK_ITEMS = [
-    ...VIEWS_META.map(([v, icon, label]) => ({ icon, label: `Go to ${label}`, act: () => switchView(v) })),
-    ...LEADS.filter(l => !q || l.username.toLowerCase().includes(q)).slice(0, 8).map(l => ({
-      icon: "🎯", label: `${l.username} — ${disp(l.status)}`, act: () => openDrawer(l.username),
-    })),
-  ].filter(it => it.icon !== "🎯" || q); // lead items only when searching
-  $("cmdkList").innerHTML = CMDK_ITEMS.length
-    ? CMDK_ITEMS.map((it, i) => `<button class="cmdk-item ${i === 0 ? "hl" : ""}" data-idx="${i}"><span>${it.icon}</span><span>${esc(it.label)}</span></button>`).join("")
-    : `<div class="cmdk-empty">No matches</div>`;
+  const views = [["overview", "📊 Overview"], ["leads", "🗂 Leads table"],
+                 ["board", "📌 Board"], ["access", "🔐 Bot access"]]
+    .filter(([v]) => !q || v.includes(q) );
+  const leads = LEADS.filter(l => !q || `${l.user_name} ${l.full_name}`.toLowerCase().includes(q))
+    .slice(0, 8);
+  $("cmdkList").innerHTML =
+    views.map(([v, label]) => `<button class="cmdk-item" data-goto="${v}">${label}</button>`).join("") +
+    leads.map(l => `<button class="cmdk-item" data-open-user="${esc(l.user_name)}">👤 ${esc(l.user_name)} <span style="opacity:.5;">· ${esc(disp(l.status))}</span></button>`).join("");
 }
 
-/* ============================================================
-   ACTION HELPERS (move, reassign)
-   ============================================================ */
-async function moveLead(username, stage) {
-  const l = LEADS.find(x => x.username === username);
-  if (!l || l.status === stage) return;
-  /* Client-side mirror of the server guardrails (db.STAGE_TRANSITIONS):
-     an Active Client can only be cancelled, a Cancelled client only
-     re-activated — never back into prospecting. */
-  if (!allowedTargets(l.status).includes(stage)) {
-    toast(l.status === "Converted"
-      ? "🔒 Active Client locked — the only change is 🚫 Cancel Deal"
-      : `🔒 Can't move a ${disp(l.status)} lead to ${disp(stage)}`, "err");
-    return;
-  }
+/* ---------- lead actions ---------- */
+async function moveLead(username, status) {
   try {
-    await api("/api/lead/stage", { method: "POST", body: { username, stage } });
-    l.status = stage;
-    toast(`${username} → ${disp(stage)}`);
-    render();
-    if ($("drawer").classList.contains("open")) openDrawer(username);
-  } catch (e) { toast(e.message || "Move failed — is the backend up?", "err"); }
+    await api("/api/lead/stage", { method: "POST", body: { username, stage: status } });
+    toast(`→ ${disp(status)}`);
+    await load({ silent: true });
+    if (DRAWER_USER) openDrawer(DRAWER_USER); else if (VIEW !== "overview") render();
+  } catch (err) { toast(err.message, "err"); }
 }
-
 async function doReassign(name) {
   try {
     await api("/api/lead/owner", { method: "POST", body: { username: DRAWER_USER, owner: name } });
-    toast(`Owner set to ${name}`);
-    await load({ silent: true });
-    closeDrawer();
-  } catch { toast("Reassign failed", "err"); }
+    toast(`Setter → ${name}`);
+    await load({ silent: true }); openDrawer(DRAWER_USER);
+  } catch (err) { toast(err.message, "err"); }
 }
 
-async function saveEdits() {
-  const l = LEADS.find(x => x.username === DRAWER_USER);
-  if (!l) return;
-  try {
-    await api("/api/lead/update", {
-      method: "POST",
-      body: {
-        username: l.username,
-        status: $("editStatus").value,
-        score: $("editScore").value,
-        platform: $("editPlatform").value.trim(),
-        owner: $("editOwner").value.trim(),
-        next_steps: $("editNextSteps").value.trim(),
-        summary: $("editSummary").value,   // full overwrite of the history text
-      },
-    });
-    toast(`${l.username} updated`);
-    await load({ silent: true });
-    openDrawer(l.username);
-  } catch (e) { toast(e.message || "Save failed — check stage/score values", "err"); }
+/* ---------- event wiring ---------- */
+function wireDrawerEvents() {
+  const body = $("drawerBody");
+  body.querySelector("#drawerClose").addEventListener("click", closeDrawer);
+  body.querySelectorAll("[data-copy]").forEach(b => b.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(b.dataset.copy); toast("Handle copied"); }
+    catch { toast("Copy failed", "err"); }
+  }));
+  body.querySelector("#statusSelect").addEventListener("change", async (e) => {
+    await moveLead(DRAWER_USER, e.target.value);
+  });
+  body.querySelectorAll("[data-flag]").forEach(btn => btn.addEventListener("click", async () => {
+    const l = LEADS.find(x => x.user_name === DRAWER_USER);
+    const field = btn.dataset.flag;
+    const next = l[field] === "Yes" ? "" : "Yes";
+    try {
+      await api("/api/lead/update", { method: "POST", body: { username: DRAWER_USER, [field]: next } });
+      await load({ silent: true }); openDrawer(DRAWER_USER);
+    } catch (err) { toast(err.message, "err"); }
+  }));
+  body.querySelector("#saveNumBtn").addEventListener("click", async () => {
+    try {
+      await api("/api/lead/update", { method: "POST", body: { username: DRAWER_USER, number: $("numInput").value.trim(), number_received: $("numInput").value.trim() ? "Yes" : "" } });
+      toast("Number saved"); await load({ silent: true }); openDrawer(DRAWER_USER);
+    } catch (err) { toast(err.message, "err"); }
+  });
+  body.querySelector("#saveDatesBtn").addEventListener("click", async () => {
+    try {
+      await api("/api/lead/update", { method: "POST", body: { username: DRAWER_USER, next_touchpoint: $("nextTpInput").value, discovery_date: $("discDateInput").value } });
+      toast("Dates saved"); await load({ silent: true }); openDrawer(DRAWER_USER);
+    } catch (err) { toast(err.message, "err"); }
+  });
+  body.querySelector("#closingSelect").addEventListener("change", async (e) => {
+    try {
+      await api("/api/lead/update", { method: "POST", body: { username: DRAWER_USER, closing_call_status: e.target.value } });
+      toast("Closing status saved"); await load({ silent: true });
+    } catch (err) { toast(err.message, "err"); }
+  });
+  body.querySelector("#closedSelect").addEventListener("change", async (e) => {
+    try {
+      await api("/api/lead/update", { method: "POST", body: { username: DRAWER_USER, closed_result: e.target.value } });
+      toast(`Closed: ${e.target.value || "reopened"}`); await load({ silent: true });
+    } catch (err) { toast(err.message, "err"); }
+  });
+  body.querySelector("#saveNoteBtn").addEventListener("click", async () => {
+    try {
+      await api("/api/lead/update", { method: "POST", body: { username: DRAWER_USER, note: $("noteArea").value } });
+      toast("Note saved"); await load({ silent: true }); openDrawer(DRAWER_USER);
+    } catch (err) { toast(err.message, "err"); }
+  });
+  body.querySelector("#ownerSelect").addEventListener("change", async (e) => {
+    if (e.target.value === "__new__") { $("newOwnerInput").style.display = "block"; $("newOwnerInput").focus(); return; }
+    await doReassign(e.target.value);
+  });
+  body.querySelector("#newOwnerInput").addEventListener("keydown", async (e) => {
+    if (e.key === "Enter" && e.target.value.trim()) await doReassign(e.target.value.trim());
+  });
+  body.querySelector("#deleteLeadBtn").addEventListener("click", async () => {
+    if (!confirm("Delete this lead from the CRM? The Google Sheet mirror updates on the next sync.")) return;
+    const victim = DRAWER_USER;
+    closeDrawer();
+    try {
+      await api("/api/lead/delete", { method: "POST", body: { username: victim } });
+      toast("Lead deleted"); await load({ silent: true });
+    } catch (err) { toast(err.message, "err"); }
+  });
 }
-/* ============================================================
-   EVENT WIRING
-   ============================================================ */
+
 function wireEvents() {
-  /* sidebar + topbar buttons */
   document.querySelectorAll(".nav-btn").forEach(b => b.addEventListener("click", () => switchView(b.dataset.view)));
   $("refreshBtn").addEventListener("click", () => load());
   $("pauseBtn").addEventListener("click", togglePause);
@@ -879,190 +842,81 @@ function wireEvents() {
   $("themeBtn").addEventListener("click", toggleTheme);
   $("q").addEventListener("input", (e) => {
     FILTER.q = e.target.value;
-    if (VIEW === "leads") renderLeads();
-    else if (VIEW === "board") renderBoard();
+    clearTimeout(window.__qT);
+    window.__qT = setTimeout(render, 180);
   });
   $("hamburger").addEventListener("click", () => $("sidebar").classList.toggle("open"));
-  if (window.matchMedia("(max-width: 900px)").matches) $("hamburger").style.display = "";
+  document.querySelectorAll(".sidebar .nav-btn, .logo").forEach(el =>
+    el.addEventListener("click", () => { if (window.innerWidth <= 900) $("sidebar").classList.remove("open"); }));
 
-  /* global click delegation */
   document.addEventListener("click", async (e) => {
-    const jump = e.target.closest("[data-stage-jump]");
-    if (jump && DRAWER_USER) { await moveLead(DRAWER_USER, jump.dataset.stageJump); return; }
-    const fstage = e.target.closest("[data-fstage]");
-    if (fstage) { FILTER.stage = FILTER.stage === fstage.dataset.fstage ? "" : fstage.dataset.fstage; render(); return; }
-    const fownerBtn = e.target.closest("[data-fowner-btn]");
-    if (fownerBtn) { FILTER.owner = fownerBtn.dataset.fownerBtn; switchView("leads"); return; }
-    const fowner = e.target.closest("[data-fowner]");
-    if (fowner) { FILTER.owner = FILTER.owner === fowner.dataset.fowner ? "" : fowner.dataset.fowner; render(); return; }
-    const uact = e.target.closest("[data-uact]");
-    if (uact) {
-      const grant = uact.dataset.unext === "1";
-      try {
-        await api("/api/user/access", { method: "POST", body: { user_id: uact.dataset.uact, authorized: grant } });
-        toast(grant ? "User whitelisted ✅" : "Access revoked ⛔");
-        loadUsers();
-      } catch (err) { toast(err.message || "Update failed", "err"); }
-      return;
+    const open = e.target.closest(".open-lead, .lead-row");
+    if (open) { openDrawer(open.dataset.open || open.dataset.user); return; }
+    const frow = e.target.closest(".funnel-row");
+    if (frow) {
+      FILTER.status = FILTER.status === frow.dataset.fstatus ? "" : frow.dataset.fstatus;
+      render(); return;
     }
-    const open = e.target.closest("[data-open]");
-    if (open) { openDrawer(open.dataset.open); return; }
-    const rowCard = e.target.closest("tr[data-user], .lead-card");
-    if (rowCard && !e.target.closest("button, a, select, input")) { openDrawer(rowCard.dataset.user); return; }
-    const cmdItem = e.target.closest(".cmdk-item");
-    if (cmdItem) { closeCmdk(); CMDK_ITEMS[+cmdItem.dataset.idx].act(); return; }
+    const goto = e.target.closest("[data-goto]");
+    if (goto) { closeCmdk(); switchView(goto.dataset.goto); return; }
+    const ou = e.target.closest("[data-open-user]");
+    if (ou) { closeCmdk(); openDrawer(ou.dataset.openUser); return; }
+    const acc = e.target.closest(".acc-toggle");
+    if (acc) {
+      try {
+        await api("/api/user/access", { method: "POST", body: { user_id: acc.dataset.id, authorized: acc.dataset.val === "1" } });
+        toast("Access updated"); await loadUsers();
+      } catch (err) { toast(err.message, "err"); }
+    }
   });
 
-  /* backdrop / keyboard shortcuts */
   $("backdrop").addEventListener("click", closeDrawer);
   document.addEventListener("keydown", (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openCmdk(); return; }
+    if ((e.ctrlKey || e.metaKey) && e.key === "k") { e.preventDefault(); openCmdk(); }
     if (e.key === "Escape") { closeCmdk(); closeDrawer(); }
-    if (e.key === "/" && !/input|textarea|select/i.test(document.activeElement.tagName)) { e.preventDefault(); $("q").focus(); }
-    if (e.key.toLowerCase() === "r" && !/input|textarea|select/i.test(document.activeElement.tagName) && !(e.metaKey || e.ctrlKey)) load();
   });
   $("cmdkInput").addEventListener("input", (e) => buildCmdk(e.target.value));
   $("cmdk").addEventListener("click", (e) => { if (e.target.id === "cmdk") closeCmdk(); });
 }
-/* drawer inner actions (delegated because drawerBody re-renders) */
-function wireDrawerEvents() {
-  $("drawerBody").addEventListener("click", async (e) => {
-    if (e.target.closest("#closeDrawerBtn")) { closeDrawer(); return; }
-    if (e.target.id === "copyHandleBtn") {
-      try { await navigator.clipboard.writeText(DRAWER_USER); toast("Handle copied"); } catch { toast("Copy failed", "err"); }
-      return;
-    }
-    if (e.target.id === "saveNextBtn") {
-      const l = LEADS.find(x => x.username === DRAWER_USER);
-      try {
-        await api("/api/lead/next_steps", { method: "POST", body: { username: DRAWER_USER, next_steps: $("nextStepInput").value } });
-        if (l) l.next_steps = $("nextStepInput").value.trim() || l.next_steps;
-        toast("Next step saved"); render();
-      } catch { toast("Save failed — is the backend up?", "err"); }
-      return;
-    }
-    if (e.target.id === "saveNoteBtn") {
-      const note = $("noteText").value.trim();
-      if (!note) { toast("Write something first", "err"); return; }
-      try {
-        await api("/api/lead/note", { method: "POST", body: { username: DRAWER_USER, note } });
-        toast("Note added"); await load({ silent: true }); openDrawer(DRAWER_USER);
-      } catch { toast("Save failed — is the backend up?", "err"); }
-      return;
-    }
-    if (e.target.id === "saveOwnerBtn") {
-      const name = $("newOwnerInput").value.trim();
-      if (!name) { toast("Enter a name", "err"); return; }
-      await doReassign(name);
-      return;
-    }
-    if (e.target.id === "saveEditBtn") {
-      await saveEdits();
-      return;
-    }
-    if (e.target.id === "deleteLeadBtn") {
-      const btn = e.target;
-      if (!btn.dataset.armed) {           // two-click guard against accidents
-        btn.dataset.armed = "1";
-        btn.textContent = "⚠️ Really delete? Click again to confirm";
-        setTimeout(() => { btn.dataset.armed = ""; btn.textContent = "🗑 Delete this lead permanently"; }, 4000);
-        return;
-      }
-      try {
-        const victim = DRAWER_USER;
-        await api("/api/lead/delete", { method: "POST", body: { username: victim } });
-        toast(`${victim} deleted`);
-        closeDrawer();
-        await load({ silent: true });
-      } catch { toast("Delete failed", "err"); }
-      return;
-    }
-  });
 
-  $("drawerBody").addEventListener("change", async (e) => {
-    if (e.target.id !== "reassignSel") return;
-    if (e.target.value === "__new__") { $("newOwnerRow").style.display = "flex"; $("newOwnerInput").focus(); }
-    else if (e.target.value) await doReassign(e.target.value);
-  });
-}
-
-/* table filter selects + sortable headers (delegated, views re-render) */
 function wireTableEvents() {
-  document.addEventListener("change", (e) => {
-    if (e.target.id === "fStage") { FILTER.stage = e.target.value; renderLeads(); }
-    else if (e.target.id === "fScore") { FILTER.score = e.target.value; renderLeads(); }
-    else if (e.target.id === "fOwner") { FILTER.owner = e.target.value; renderLeads(); }
-  });
-  document.addEventListener("click", (e) => {
-    const th = e.target.closest("th[data-sort]");
-    if (!th) return;
-    if (SORT.key === th.dataset.sort) SORT.dir *= -1;
-    else { SORT.key = th.dataset.sort; SORT.dir = -1; }
+  document.querySelectorAll("th[data-sort]").forEach(th => th.addEventListener("click", () => {
+    const k = th.dataset.sort;
+    if (SORT.key === k) SORT.dir *= -1; else { SORT.key = k; SORT.dir = 1; }
     renderLeads();
-  });
+  }));
+  const fs = $("fStage"), fo = $("fOwner"), cb = $("clearBtn");
+  if (fs) fs.addEventListener("change", (e) => { FILTER.status = e.target.value; renderLeads(); });
+  if (fo) fo.addEventListener("change", (e) => { FILTER.setter = e.target.value; renderLeads(); });
+  if (cb) cb.addEventListener("click", () => { FILTER = { status: "", setter: "", q: "" }; $("q").value = ""; renderLeads(); });
 }
-
-/* ============================================================
-   DRAG & DROP
-   ============================================================ */
-let DND_USER = null;
 
 function wireDragAndDrop() {
-  document.addEventListener("dragstart", (e) => {
-    const card = e.target.closest(".lead-card");
-    if (!card) return;
-    DND_USER = card.dataset.user;
-    card.classList.add("dragging");
-    document.body.classList.add("dragging-active");
-    e.dataTransfer.effectAllowed = "move";
-    try { e.dataTransfer.setData("text/plain", DND_USER); } catch {}
+  let dragged = null;
+  document.querySelectorAll(".lead-card").forEach(card => {
+    card.addEventListener("dragstart", () => { dragged = card; card.classList.add("dragging"); });
+    card.addEventListener("dragend", () => { card.classList.remove("dragging"); });
   });
-
-  document.addEventListener("dragend", () => {
-    document.querySelectorAll(".lead-card.dragging").forEach(c => c.classList.remove("dragging"));
-    document.querySelectorAll(".kanban-col.dragover").forEach(c => c.classList.remove("dragover"));
-    document.body.classList.remove("dragging-active");
-    DND_USER = null;
-  });
-
-  document.addEventListener("dragover", (e) => {
-    const col = e.target.closest(".kanban-col");
-    if (!col || !DND_USER) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "move";
-    document.querySelectorAll(".kanban-col.dragover").forEach(c => c.classList.remove("dragover"));
-    col.classList.add("dragover");
-  });
-
-  document.addEventListener("drop", (e) => {
-    const col = e.target.closest(".kanban-col");
-    if (!col || !DND_USER) return;
-    e.preventDefault();
-    moveLead(DND_USER, col.dataset.stage); // moveLead re-renders the board
+  document.querySelectorAll("[data-stage-drop]").forEach(zone => {
+    zone.addEventListener("dragover", (e) => { e.preventDefault(); zone.classList.add("drop-hover"); });
+    zone.addEventListener("dragleave", () => zone.classList.remove("drop-hover"));
+    zone.addEventListener("drop", (e) => {
+      e.preventDefault(); zone.classList.remove("drop-hover");
+      if (dragged) moveLead(dragged.dataset.user, zone.dataset.stageDrop);
+      dragged = null;
+    });
   });
 }
 
-/* ============================================================
-   BOOT
-   ============================================================ */
-document.addEventListener("DOMContentLoaded", () => {
-  let saved = null;
-  try { saved = localStorage.getItem("gretta_theme"); } catch {}
-  applyTheme(saved === "light" ? "light" : "dark");
-
-  window.addEventListener("hashchange", () => switchView(viewFromHash()));
-  VIEW = viewFromHash();
-
+/* ---------- boot ---------- */
+(async function main() {
+  applyTheme(localStorage.getItem("gretta-theme") || "dark");
   wireEvents();
-  wireDrawerEvents();
-  wireTableEvents();
-  wireDragAndDrop();
   wireLogin();
-
-  /* Auth gate first: only start polling the CRM once we may see it. */
-  initAuth().then((mayEnter) => {
-    if (!AUTH_REQUIRED) $("logoutBtn").style.display = "none";
-    if (mayEnter) load().then(startPolling);
-    else showLogin();
-  });
-});
+  switchView(viewFromHash());
+  if (await initAuth()) {
+    await load();
+    await loadUsers();
+    startPolling();
+  }
+})();

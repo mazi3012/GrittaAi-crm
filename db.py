@@ -1,22 +1,30 @@
-"""Shared data layer for Gretta AI.
+"""Shared data layer for Gretta AI — Instagram outreach CRM.
 
 Used by BOTH bot.py and dashboard.py so the schema lives in exactly one
-place.
+place. The `leads` table mirrors the team's Google Sheet "CRM - Instagram
+Data" COLUMN-FOR-COLUMN (one row here == one row in a setter's tab), so
+the database and the sheet are 1:1 clones of each other:
+
+  Lead Number | Full Name (Lead) | User name (Lead) | Profile Link |
+  Followers Count | Sender Name | Sender Profile | First Touchpoint (Date) |
+  Note | Status | Last Touchpoint (Date) | Next Touchpoint (Date) |
+  Replied | Number Received | Number | Follow up 1..4 (+ Date) |
+  Discovery Call | Discovery Date | Closing Call Status | Closed (Won/Lost)
 
 Engines:
 - DATABASE_URL set -> Neon/Postgres (shared cloud DB: bot on Render +
   dashboard on Vercel see the same leads).
-- DATABASE_URL unset -> local SQLite file (offline dev fallback), WAL mode
-  so the bot can write while the dashboard reads without locking errors.
+- DATABASE_URL unset -> local SQLite file (WAL mode) fallback.
 
-Both drivers expose the same cursor surface used here (execute /
-fetchone / fetchall / rowcount / commit); only the placeholder style
-differs (%s vs ?), handled by _PH.
+A legacy screenshot-triage schema (username/lead_score/stages) is detected
+on startup and auto-migrated into this one; the original rows are preserved
+untouched in `leads_legacy` so nothing is ever lost.
 """
 
 import os
 import sqlite3
 import threading
+from datetime import date
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 USE_PG = bool(DATABASE_URL)
@@ -28,22 +36,85 @@ _PH = "%s" if USE_PG else "?"  # query placeholder per engine
 if USE_PG:
     import psycopg  # noqa: F401  (import early so missing driver fails fast)
 
+# --------------------------------------------------------------- vocabulary
+# The 14 Status values of the sheet's dropdown, in pipeline order.
+STATUSES = (
+    "Message Sent", "Seen Not Replied", "Replied",
+    "Follow up 1", "Follow up 2", "Follow up 3", "Follow up 4",
+    "Replied-No yet booked", "Closing Call", "Number received",
+    "Discovery Call booked", "Not Interested", "Lost", "Won",
+)
+
+# The Yes/No dropdown columns (empty = not answered yet).
+YESNO = ("Yes", "No", "")
+
+# Warm leads a CLOSER should pick up -> mirrored to the sheet's Closer tab.
+CLOSER_STATUSES = ("Replied", "Replied-No yet booked", "Number received",
+                   "Closing Call", "Discovery Call booked", "Won")
+
+# Old screenshot-triage stages -> new outreach statuses (legacy migration).
+OLD_TO_STATUS = {
+    "New": "Message Sent", "Contacted": "Message Sent",
+    "Meeting Booked": "Discovery Call booked", "Converted": "Won",
+    "Cancelled": "Not Interested", "Lost": "Lost",
+}
+
+# The 27 sheet columns in exact tab order -> field names used everywhere.
+LEAD_FIELDS = (
+    "lead_number", "full_name", "user_name", "profile_link",
+    "followers_count", "sender_name", "sender_profile",
+    "first_touchpoint", "note", "status", "last_touchpoint",
+    "next_touchpoint", "replied", "number_received", "number",
+    "follow_up_1", "follow_up_1_date", "follow_up_2", "follow_up_2_date",
+    "follow_up_3", "follow_up_3_date", "follow_up_4", "follow_up_4_date",
+    "discovery_call", "discovery_date", "closing_call_status",
+    "closed_result",
+)
+
+# Dropdown values for the sheet's "Closing Call Status" column.
+CLOSING_CALL_STATUSES = (
+    "", "Interested", "Not Interested", "No Response", "Scheduled",
+    "Completed", "Rescheduled", "No Show",
+)
+
+# Fields callers may write via update_lead()/upsert_lead().
+UPDATABLE_FIELDS = tuple(f for f in LEAD_FIELDS if f != "user_name")
+
 _SCHEMA = (
     """
     CREATE TABLE IF NOT EXISTS leads (
-        username TEXT PRIMARY KEY,
-        claimed_by TEXT,
-        status TEXT DEFAULT 'New',
-        lead_score TEXT DEFAULT 'UNKNOWN',
-        platform TEXT DEFAULT 'Instagram',
-        next_steps TEXT DEFAULT 'Review lead details',
-        conversation_summary TEXT,
-        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        lead_number INTEGER DEFAULT 0,
+        full_name TEXT DEFAULT '',
+        user_name TEXT PRIMARY KEY,
+        profile_link TEXT DEFAULT '',
+        followers_count TEXT DEFAULT '',
+        sender_name TEXT DEFAULT '',
+        sender_profile TEXT DEFAULT '',
+        first_touchpoint TEXT DEFAULT '',
+        note TEXT DEFAULT '',
+        status TEXT DEFAULT 'Message Sent',
+        last_touchpoint TEXT DEFAULT '',
+        next_touchpoint TEXT DEFAULT '',
+        replied TEXT DEFAULT '',
+        number_received TEXT DEFAULT '',
+        number TEXT DEFAULT '',
+        follow_up_1 TEXT DEFAULT '',
+        follow_up_1_date TEXT DEFAULT '',
+        follow_up_2 TEXT DEFAULT '',
+        follow_up_2_date TEXT DEFAULT '',
+        follow_up_3 TEXT DEFAULT '',
+        follow_up_3_date TEXT DEFAULT '',
+        follow_up_4 TEXT DEFAULT '',
+        follow_up_4_date TEXT DEFAULT '',
+        discovery_call TEXT DEFAULT '',
+        discovery_date TEXT DEFAULT '',
+        closing_call_status TEXT DEFAULT '',
+        closed_result TEXT DEFAULT '',
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """,
-    # Audit log of every Telegram account that ever talks to the bot, so the
-    # team can see exactly who is using it and whitelist genuine teammates
-    # (see the access gate in bot.py and the Bot Access tab in dashboard.py).
+    # Audit log of every Telegram account that ever talks to the bot (see
+    # the access gate in bot.py and the Bot Access tab in dashboard.py).
     """
     CREATE TABLE IF NOT EXISTS bot_users (
         telegram_id TEXT PRIMARY KEY,
@@ -74,34 +145,25 @@ def _connect():
     return conn
 
 
-def _with_ts(row):
-    """Normalize last_updated (index 7) to 'YYYY-MM-DD HH:MM:SS' strings.
-
-    Postgres returns datetime objects; SQLite returns strings. The SPA
-    sorts/displays via Date.parse(), so keep the wire format identical.
-    """
-    if row is not None and hasattr(row[7], "strftime"):
-        row = row[:7] + (row[7].strftime("%Y-%m-%d %H:%M:%S"),)
-    return row
-
-
-def init_db():
-    """Create the schema once per process (cheap no-op afterwards)."""
-    global _initialized
-    if _initialized:
-        return
-    with _write_lock:
-        conn = _connect()
-        try:
-            for statement in _SCHEMA:
-                conn.execute(statement)
-            conn.commit()
-        finally:
-            conn.close()
-        _initialized = True
+def _table_columns(conn, table):
+    """Column-name set for a table, engine-agnostic."""
+    if USE_PG:
+        cur = conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = %s",
+            (table,),
+        )
+        return {r[0] for r in cur.fetchall()}
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return {r[1] for r in cur.fetchall()}
 
 
-def normalize_username(username: str) -> str:
+def today_str():
+    """Today as an ISO 'YYYY-MM-DD' string (canonical date storage format)."""
+    return date.today().strftime("%Y-%m-%d")
+
+
+def normalize_username(username):
     """Trim, force a leading @, and lowercase for deterministic storage."""
     username = (username or "").strip().lower()
     if username and not username.startswith("@"):
@@ -109,376 +171,335 @@ def normalize_username(username: str) -> str:
     return username
 
 
-def get_lead(username):
-    """Return the raw lead row tuple, or None if the lead is unknown."""
+def profile_link_for(username):
+    """Build the Instagram profile URL from a @handle."""
+    handle = (username or "").strip().lstrip("@")
+    return f"https://www.instagram.com/{handle}/" if handle else ""
+
+
+def _row_to_dict(row):
+    lead = dict(zip(LEAD_FIELDS, row))
+    if len(row) > len(LEAD_FIELDS):          # queries that add updated_at
+        lead["updated_at"] = row[-1]
+    return lead
+
+
+def init_db():
+    """Create the schema once per process; migrate legacy data if found."""
+    global _initialized
+    if _initialized:
+        return
+    with _write_lock:
+        conn = _connect()
+        try:
+            legacy = _fetch_legacy_rows(conn)
+            if legacy is not None:
+                conn.execute("ALTER TABLE leads RENAME TO leads_legacy")
+                conn.commit()
+            for statement in _SCHEMA:
+                conn.execute(statement)
+            conn.commit()
+            if legacy:
+                _import_legacy_rows(conn, legacy)
+                conn.commit()
+        finally:
+            conn.close()
+        _initialized = True
+
+
+def _fetch_legacy_rows(conn):
+    """Legacy rows (old schema) or None when the table is already new."""
+    cols = _table_columns(conn, "leads")
+    if not cols or "lead_score" not in cols:
+        return None
+    cur = conn.execute(
+        "SELECT username, claimed_by, status, conversation_summary, "
+        "last_updated FROM leads ORDER BY last_updated"
+    )
+    return cur.fetchall()
+
+
+def _import_legacy_rows(conn, legacy_rows):
+    """Best-effort mapping of old screenshot-triage rows into this schema."""
+    for username, claimed_by, status, summary, last_updated in legacy_rows:
+        uname = normalize_username(username)
+        if not uname:
+            continue
+        sender = ("@" + claimed_by.strip().lstrip("@").lower()) if claimed_by else ""
+        sender = sender or "@imported"
+        new_status = OLD_TO_STATUS.get((status or "").strip(), "Message Sent")
+        day = ""
+        if last_updated is not None:
+            day = (last_updated.strftime("%Y-%m-%d")
+                   if hasattr(last_updated, "strftime") else str(last_updated)[:10])
+        num = _next_lead_number(conn, sender)
+        conn.execute(
+            f"INSERT INTO leads (lead_number, user_name, profile_link, "
+            f"sender_name, note, status, first_touchpoint, last_touchpoint) "
+            f"VALUES ({_PH}, {_PH}, {_PH}, {_PH}, {_PH}, {_PH}, {_PH}, {_PH})",
+            (num, uname, profile_link_for(uname), sender,
+             (summary or "").strip(), new_status, day, day),
+        )
+
+
+def _next_lead_number(conn, sender_name):
+    """Next per-setter Lead Number (mirrors how each tab counts 1, 2, 3…)."""
+    cur = conn.execute(
+        f"SELECT MAX(lead_number) FROM leads WHERE LOWER(sender_name) = LOWER({_PH})",
+        (sender_name or "",),
+    )
+    row = cur.fetchone()
+    return (row[0] or 0) + 1
+
+
+def _notify_sheet(reason):
+    """Fire-and-forget Google Sheet mirror push (no-op unless configured)."""
+    try:
+        import sheets
+        sheets.request_sync(reason)
+    except Exception:
+        pass
+
+
+def add_lead(user_name, full_name="", sender_name="", followers_count="",
+             note="", status="Message Sent", sender_profile="",
+             number=""):
+    """Create a lead for a setter; returns (lead_dict, created).
+
+    Lead Number auto-increments PER SETTER (like each sheet tab), the
+    profile link is built from the handle, and both touchpoints are
+    stamped with today's date.
+    """
     init_db()
+    uname = normalize_username(user_name)
+    if not uname:
+        raise ValueError("A lead @username is required")
+    if status not in STATUSES:
+        raise ValueError(f"Invalid status '{status}'")
+    existing = get_lead(uname)
+    if existing is not None:
+        return existing, False
+    sender = (sender_name or "").strip() or "Unassigned"
+    number_received = "Yes" if (number or "").strip() else ""
+    today = today_str()
     conn = _connect()
     try:
+        with _write_lock:
+            num = _next_lead_number(conn, sender)
+            conn.execute(
+                f"INSERT INTO leads (lead_number, full_name, user_name, "
+                f"profile_link, followers_count, sender_name, sender_profile, "
+                f"first_touchpoint, note, status, last_touchpoint, number, "
+                f"number_received) "
+                f"VALUES ({_PH}, {_PH}, {_PH}, {_PH}, {_PH}, {_PH}, {_PH}, "
+                f"{_PH}, {_PH}, {_PH}, {_PH}, {_PH}, {_PH})",
+                (num, (full_name or "").strip(), uname,
+                 profile_link_for(uname), (followers_count or "").strip(),
+                 sender, (sender_profile or "").strip(), today,
+                 (note or "").strip(), status, today,
+                 (number or "").strip(), number_received),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+    _notify_sheet(f"add_lead:{uname}")
+    return get_lead(uname), True
+
+
+def _apply_rules(fields):
+    """Sheet-consistent side effects, applied to every write path."""
+    for n in (1, 2, 3, 4):
+        key = f"follow_up_{n}"
+        if fields.get(key) == "Yes" and not fields.get(f"{key}_date"):
+            fields[f"{key}_date"] = today_str()
+    if str(fields.get("number") or "").strip():
+        fields.setdefault("number_received", "Yes")
+    for key in ("replied", "number_received", "discovery_call"):
+        if key in fields and fields[key] not in YESNO:
+            raise ValueError(f"{key} must be 'Yes', 'No' or empty")
+    if "closing_call_status" in fields and \
+            fields["closing_call_status"] not in CLOSING_CALL_STATUSES:
+        raise ValueError(
+            f"Invalid closing call status '{fields['closing_call_status']}' "
+            f"— valid: {', '.join(s for s in CLOSING_CALL_STATUSES if s)}")
+    if "status" in fields and fields["status"] not in STATUSES:
+        raise ValueError(f"Invalid status '{fields['status']}'")
+
+
+def get_lead(user_name):
+    """Return one lead as a dict, or None when unknown."""
+    init_db()
+    uname = normalize_username(user_name)
+    if not uname:
+        return None
+    conn = _connect()
+    try:
+        cols = ", ".join(LEAD_FIELDS)
         cur = conn.execute(
-            "SELECT username, claimed_by, status, lead_score, platform, "
-            "next_steps, conversation_summary, last_updated "
-            f"FROM leads WHERE LOWER(username) = {_PH}",
-            (normalize_username(username),),
+            f"SELECT {cols} FROM leads WHERE LOWER(user_name) = {_PH}",
+            (uname,),
         )
-        return _with_ts(cur.fetchone())
+        row = cur.fetchone()
+        return _row_to_dict(row) if row else None
     finally:
         conn.close()
 
 
-def save_lead(username, claimed_by=None, status=None, lead_score="UNKNOWN",
-              platform="Instagram", next_steps="", summary=""):
-    """Upsert a lead, merging fields instead of blindly overwriting.
+def update_lead(user_name, **fields):
+    """Merge validated fields into a lead; returns the fresh lead dict.
 
-    Business rules (enforced here so callers can't get them wrong):
-    - the FIRST owner is kept forever -> no lead stealing
-    - a fresh 'New' lead moves to 'Contacted' the moment it gets an owner
-    - unpassed/empty fields never erase known ones
-    - summaries are appended, a new non-default score always wins
-
-    The merge is done in explicit Python (not SQL upsert gymnastics) so every
-    rule is readable and testable.
+    Any write bumps Last Touchpoint to today (that is what the column
+    means in the sheet) unless the caller sets it explicitly.
     """
     init_db()
-    username = normalize_username(username)
+    uname = normalize_username(user_name)
+    if not uname:
+        raise ValueError("A lead @username is required")
+    clean = {k: v for k, v in fields.items() if k in UPDATABLE_FIELDS}
+    if not clean:
+        return get_lead(uname)
+    _apply_rules(clean)
+    clean.setdefault("last_touchpoint", today_str())
+    assignments = ", ".join(f"{k} = {_PH}" for k in clean)
     conn = _connect()
     try:
         with _write_lock:
             cur = conn.execute(
-                "SELECT claimed_by, status, lead_score, platform, next_steps,"
-                " conversation_summary FROM leads WHERE LOWER(username) = " + _PH,
-                (username,),
+                f"UPDATE leads SET {assignments}, "
+                f"updated_at = CURRENT_TIMESTAMP "
+                f"WHERE LOWER(user_name) = {_PH}",
+                tuple(clean.values()) + (uname,),
             )
-            existing = cur.fetchone()
-
-            if existing is None:
-                # --- brand new lead -------------------------------------
-                conn.execute(
-                    f"""
-                    INSERT INTO leads
-                        (username, claimed_by, status, lead_score, platform,
-                         next_steps, conversation_summary, last_updated)
-                    VALUES ({_PH}, {_PH}, {_PH}, {_PH}, {_PH}, {_PH}, {_PH},
-                            CURRENT_TIMESTAMP)
-                    """,
-                    (
-                        username,
-                        claimed_by,
-                        status or ("Contacted" if claimed_by else "New"),
-                        lead_score if lead_score != "UNKNOWN" else "UNKNOWN",
-                        platform or "Instagram",
-                        next_steps or "Review lead details",
-                        summary or None,
-                    ),
-                )
-            else:
-                # --- merge into the existing row ------------------------
-                ex_owner, ex_status, ex_score = existing[0], existing[1], existing[2]
-                ex_platform, ex_next, ex_summary = existing[3], existing[4], existing[5]
-
-                new_owner = ex_owner if ex_owner else claimed_by
-
-                if ex_status in (None, "", "New") and (claimed_by or new_owner):
-                    new_status = "Contacted"          # first touch auto-advances
-                else:
-                    new_status = status if status not in (None, "") else (ex_status or "New")
-
-                # Active Clients / Cancelled are LOCKED: a re-run of screenshot
-                # analysis must never silently reopen or re-close the deal.
-                if ex_status in CLOSED_STAGES:
-                    new_status = ex_status
-
-                new_score = lead_score if lead_score != "UNKNOWN" else (ex_score or "UNKNOWN")
-                new_platform = platform if platform else (ex_platform or "Instagram")
-                new_next = next_steps if next_steps else (ex_next or "Review lead details")
-
-                if not ex_summary:
-                    new_summary = summary or None
-                elif summary:
-                    new_summary = f"{ex_summary} | {summary}"
-                else:
-                    new_summary = ex_summary
-
-                conn.execute(
-                    f"""
-                    UPDATE leads
-                       SET claimed_by = {_PH},
-                           status = {_PH},
-                           lead_score = {_PH},
-                           platform = {_PH},
-                           next_steps = {_PH},
-                           conversation_summary = {_PH},
-                           last_updated = CURRENT_TIMESTAMP
-                     WHERE LOWER(username) = {_PH}
-                    """,
-                    (new_owner, new_status, new_score, new_platform,
-                     new_next, new_summary, username),
-                )
+            if cur.rowcount == 0:
+                return None
             conn.commit()
     finally:
         conn.close()
+    _notify_sheet(f"update:{uname}")
+    return get_lead(uname)
 
 
-def all_leads():
-    """Every lead, newest activity first (raw row tuples)."""
-    init_db()
-    conn = _connect()
-    try:
-        cur = conn.execute(
-            "SELECT username, claimed_by, status, lead_score, platform, "
-            "next_steps, conversation_summary, last_updated "
-            "FROM leads ORDER BY last_updated DESC"
-        )
-        return [_with_ts(r) for r in cur.fetchall()]
-    finally:
-        conn.close()
+def upsert_lead(fields):
+    """Insert-or-update a full lead (the Google Sheet import path).
 
-
-def leads_for_owner(owner):
-    """Leads owned by one teammate, newest activity first."""
-    init_db()
-    conn = _connect()
-    try:
-        cur = conn.execute(
-            "SELECT username, claimed_by, status, lead_score, platform, "
-            "next_steps, conversation_summary, last_updated "
-            f"FROM leads WHERE LOWER(claimed_by) = LOWER({_PH}) "
-            "ORDER BY last_updated DESC",
-            ((owner or "").strip(),),
-        )
-        return [_with_ts(r) for r in cur.fetchall()]
-    finally:
-        conn.close()
-
-
-VALID_STAGES = ("New", "Contacted", "Meeting Booked", "Converted",
-                "Cancelled", "Lost")
-
-# Stages that end the prospecting pipeline. A CONVERTED deal becomes the
-# client's ACTIVE service and is locked against accidental regression;
-# CANCELLED marks a client who explicitly quit the service.
-CLOSED_STAGES = ("Converted", "Cancelled")
-
-# Allowed stage moves. Anything not listed is rejected, so neither the
-# Telegram buttons nor the dashboard can drag an Active Client back into
-# prospecting by accident. Re-activation after a cancellation IS allowed
-# (the client came back), and a lost deal can be revived by contacting again.
-STAGE_TRANSITIONS = {
-    "New": ("Contacted", "Meeting Booked", "Converted", "Lost"),
-    "Contacted": ("New", "Meeting Booked", "Converted", "Lost"),
-    "Meeting Booked": ("New", "Contacted", "Converted", "Lost"),
-    "Converted": ("Cancelled",),           # only exit: cancel the deal
-    "Cancelled": ("Converted",),           # only exit: re-activate the client
-    "Lost": ("New", "Contacted", "Meeting Booked", "Converted"),
-}
-
-
-def allowed_transitions(status):
-    """Stages a lead may legally move to from its current stage."""
-    return STAGE_TRANSITIONS.get(status or "New", ())
-
-
-def can_move_stage(current, target):
-    """True when moving current -> target respects the pipeline guardrails."""
-    if target not in VALID_STAGES:
-        return False
-    if target == current:
-        return True
-    return target in allowed_transitions(current)
-
-
-def assign_owner(username, owner):
-    """Explicitly (re)assign a lead's owner from the dashboard.
-
-    Unlike save_lead — whose first-owner-wins rule protects the bot flow —
-    this is an intentional manual override from the dashboard, so it MAY
-    replace an existing owner. Pass owner="" to unassign (stored as NULL).
-    Returns True if a row was updated.
+    Sheet values win; missing fields keep their defaults. Returns
+    (lead_dict, created).
     """
     init_db()
-    username = normalize_username(username)
-    if not username:
+    data = {k: v for k, v in (fields or {}).items() if k in LEAD_FIELDS}
+    uname = normalize_username(data.get("user_name"))
+    if not uname:
+        raise ValueError("A lead @username is required")
+    data["user_name"] = uname
+    _apply_rules(data)
+    if get_lead(uname) is None:
+        sender = (data.get("sender_name") or "").strip() or "Unassigned"
+        today = today_str()
+        data.setdefault("profile_link", profile_link_for(uname))
+        data.setdefault("status", "Message Sent")
+        data.setdefault("first_touchpoint", today)
+        data.setdefault("last_touchpoint", today)
+        conn = _connect()
+        try:
+            with _write_lock:
+                if not data.get("lead_number"):
+                    data["lead_number"] = _next_lead_number(conn, sender)
+                cols = list(LEAD_FIELDS)
+                conn.execute(
+                    f"INSERT INTO leads ({', '.join(cols)}) "
+                    f"VALUES ({', '.join(_PH for _ in cols)})",
+                    tuple((data.get(c) if data.get(c) is not None else "")
+                          for c in cols),
+                )
+                conn.commit()
+        finally:
+            conn.close()
+        _notify_sheet(f"import:{uname}")
+        return get_lead(uname), True
+    fresh = update_lead(uname, **{k: v for k, v in data.items() if k != "user_name"})
+    return fresh, False
+
+
+def all_leads(sender_name=None):
+    """Every lead (or one setter's), sheet order: setter then Lead Number."""
+    init_db()
+    cols = ", ".join(LEAD_FIELDS) + ", updated_at"
+    conn = _connect()
+    try:
+        if sender_name:
+            cur = conn.execute(
+                f"SELECT {cols} FROM leads "
+                f"WHERE LOWER(sender_name) = LOWER({_PH}) ORDER BY lead_number",
+                ((sender_name or "").strip(),),
+            )
+        else:
+            cur = conn.execute(
+                f"SELECT {cols} FROM leads ORDER BY sender_name, lead_number")
+        return [_row_to_dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def leads_for_setter(sender_name):
+    """Convenience alias: one setter's leads in tab order."""
+    return all_leads(sender_name)
+
+
+def delete_lead(user_name):
+    init_db()
+    uname = normalize_username(user_name)
+    if not uname:
         return False
-    owner = (owner or "").strip() or None
     conn = _connect()
     try:
         with _write_lock:
             cur = conn.execute(
-                "UPDATE leads SET claimed_by = " + _PH +
-                ", last_updated = CURRENT_TIMESTAMP "
-                "WHERE LOWER(username) = " + _PH,
-                (owner, username),
-            )
+                f"DELETE FROM leads WHERE LOWER(user_name) = {_PH}", (uname,))
             conn.commit()
-            return cur.rowcount > 0
+            deleted = cur.rowcount > 0
+    finally:
+        conn.close()
+    if deleted:
+        _notify_sheet(f"delete:{uname}")
+    return deleted
+
+
+def setter_names():
+    """Every distinct Sender Name (setter), alphabetical."""
+    init_db()
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "SELECT DISTINCT sender_name FROM leads "
+            "WHERE sender_name <> '' ORDER BY sender_name"
+        )
+        return [r[0] for r in cur.fetchall()]
     finally:
         conn.close()
 
 
 def dashboard_stats():
-    """Aggregated counters for the dashboard KPI cards (single pass in SQL)."""
-    init_db()
-    conn = _connect()
-    try:
-        cur = conn.execute(
-            """
-            SELECT COUNT(*),
-                   SUM(CASE WHEN LOWER(claimed_by) IS NULL OR LOWER(claimed_by) = '' THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN UPPER(lead_score) = 'HIGH' THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN status = 'Converted' THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN status = 'Meeting Booked' THEN 1 ELSE 0 END),
-                   SUM(CASE WHEN status = 'Cancelled' THEN 1 ELSE 0 END)
-              FROM leads
-            """
-        )
-        total, unclaimed, hot, converted, meetings, cancelled = cur.fetchone()
-        return {
-            "total": total or 0,
-            "unclaimed": unclaimed or 0,
-            "hot": hot or 0,
-            "converted": converted or 0,
-            "meetings": meetings or 0,
-            "cancelled": cancelled or 0,
-        }
-    finally:
-        conn.close()
-
-
-VALID_SCORES = ("HIGH", "MEDIUM", "LOW", "UNKNOWN")
-
-
-def update_lead(username, claimed_by=None, status=None, lead_score=None,
-                platform=None, next_steps=None, summary=None):
-    """Explicit field edit from the dashboard (bypasses save_lead merge rules).
-
-    Only the fields you pass are changed; pass None to leave a field alone.
-    claimed_by="" unclaims, summary replaces the whole conversation history.
-    Returns True if a row was updated.
-    """
-    init_db()
-    username = normalize_username(username)
-    if not username:
-        return False
-    sets, vals = [], []
-
-    # Status changes must respect the pipeline guardrails: an ACTIVE CLIENT
-    # (Converted) can only be cancelled, and a Cancelled client can only be
-    # re-activated — never silently dragged back to New/Contacted.
-    if status is not None:
-        if status not in VALID_STAGES:
-            return False
-        conn = _connect()
-        try:
-            cur = conn.execute(
-                "SELECT status FROM leads WHERE LOWER(username) = " + _PH,
-                (username,),
-            )
-            row = cur.fetchone()
-        finally:
-            conn.close()
-        current_status = row[0] if row else None
-        if current_status is None:
-            return False
-        if not can_move_stage(current_status, status):
-            return False
-        if status == current_status:
-            status = None  # no-op move; skip the column entirely
-
-    if claimed_by is not None:
-        sets.append(f"claimed_by = {_PH}")
-        vals.append(claimed_by.strip() or None)
-    if status is not None:
-        if status not in VALID_STAGES:
-            return False
-        sets.append(f"status = {_PH}")
-        vals.append(status)
-    if lead_score is not None:
-        if lead_score not in VALID_SCORES:
-            return False
-        sets.append(f"lead_score = {_PH}")
-        vals.append(lead_score)
-    if platform is not None:
-        sets.append(f"platform = {_PH}")
-        vals.append(platform.strip() or "Instagram")
-    if next_steps is not None:
-        sets.append(f"next_steps = {_PH}")
-        vals.append(next_steps.strip() or "Review lead details")
-    if summary is not None:
-        sets.append(f"conversation_summary = {_PH}")
-        vals.append(summary.strip() or None)
-
-    if not sets:
-        return True
-    conn = _connect()
-    try:
-        with _write_lock:
-            cur = conn.execute(
-                f"UPDATE leads SET {', '.join(sets)}, last_updated = CURRENT_TIMESTAMP "
-                "WHERE LOWER(username) = " + _PH,
-                (*vals, username),
-            )
-            conn.commit()
-            return cur.rowcount > 0
-    finally:
-        conn.close()
-
-
-def delete_lead(username):
-    """Remove a lead permanently (dashboard delete button)."""
-    init_db()
-    username = normalize_username(username)
-    if not username:
-        return False
-    conn = _connect()
-    try:
-        with _write_lock:
-            cur = conn.execute(
-                "DELETE FROM leads WHERE LOWER(username) = " + _PH, (username,)
-            )
-            conn.commit()
-            return cur.rowcount > 0
-    finally:
-        conn.close()
-
-
-def set_lead_stage(username, stage):
-    """Move a lead to a pipeline stage; returns True if a row was updated.
-
-    Unknown stages are rejected so button callbacks can never corrupt data,
-    and STAGE_TRANSITIONS protects won/churned clients: a Converted lead is
-    the ACTIVE CLIENT (locked) and can only be moved to Cancelled via an
-    explicit cancel-deal; a Cancelled client can only be re-activated.
-    """
-    if stage not in VALID_STAGES:
-        return False
-    init_db()
-    username = normalize_username(username)
-    if not username:
-        return False
-    conn = _connect()
-    try:
-        with _write_lock:
-            cur = conn.execute(
-                "SELECT status FROM leads WHERE LOWER(username) = " + _PH,
-                (username,),
-            )
-            row = cur.fetchone()
-            if row is None:
-                return False
-            current = row[0] or "New"
-            if stage == current:
-                return True
-            if stage not in allowed_transitions(current):
-                return False
-            cur = conn.execute(
-                "UPDATE leads SET status = " + _PH +
-                ", last_updated = CURRENT_TIMESTAMP "
-                "WHERE LOWER(username) = " + _PH,
-                (stage, username),
-            )
-            conn.commit()
-            return cur.rowcount > 0
-    finally:
-        conn.close()
+    """Aggregates for /stats and the dashboard: totals per status/setter."""
+    rows = all_leads()
+    by_status = {s: 0 for s in STATUSES}
+    setters = {}
+    for lead in rows:
+        status = lead["status"] or "Message Sent"
+        by_status[status] = by_status.get(status, 0) + 1
+        bucket = setters.setdefault(
+            lead["sender_name"] or "Unassigned",
+            {"total": 0, "by_status": {s: 0 for s in STATUSES}})
+        bucket["total"] += 1
+        bucket["by_status"][status] = bucket["by_status"].get(status, 0) + 1
+    warm = sum(by_status.get(s, 0) for s in CLOSER_STATUSES)
+    return {
+        "total": len(rows),
+        "by_status": by_status,
+        "setters": setters,
+        "warm": warm,
+        "won": by_status.get("Won", 0),
+        "lost": by_status.get("Lost", 0) + by_status.get("Not Interested", 0),
+    }
 
 
 # ------------------------------------------------------------- bot access
@@ -519,17 +540,15 @@ def track_bot_user(telegram_id, username=None, first_name=None):
                 )
             else:
                 conn.execute(
-                    """
-                    INSERT INTO bot_users
-                        (telegram_id, username, first_name, msg_count,
-                         first_seen, last_seen)
-                    VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                    ON CONFLICT(telegram_id) DO UPDATE SET
-                        username = excluded.username,
-                        first_name = excluded.first_name,
-                        msg_count = msg_count + 1,
-                        last_seen = CURRENT_TIMESTAMP
-                    """,
+                    f"INSERT INTO bot_users (telegram_id, username, first_name,"
+                    f" msg_count, first_seen, last_seen) "
+                    f"VALUES ({_PH}, {_PH}, {_PH}, 1, CURRENT_TIMESTAMP, "
+                    f"CURRENT_TIMESTAMP) "
+                    f"ON CONFLICT(telegram_id) DO UPDATE SET "
+                    f"username = excluded.username, "
+                    f"first_name = excluded.first_name, "
+                    f"msg_count = msg_count + 1, "
+                    f"last_seen = CURRENT_TIMESTAMP",
                     (tid, handle or None, (first_name or "").strip() or None),
                 )
             conn.commit()

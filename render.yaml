@@ -35,9 +35,8 @@ services:
         sync: false
       - key: MODEL
         value: stealth/ox-alpha
-      # ox-alpha image path was 502-ing upstream; free NVIDIA vision model verified working.
-      # Revert to stealth/ox-alpha once its image support recovers.
+      # Screenshot analysis uses the same ox-alpha model (vision-capable).
       - key: VISION_MODEL
-        value: nvidia/nemotron-nano-12b-v2-vl:free
+        value: stealth/ox-alpha
       # Render injects PORT automatically; bot.py reads it (default 7860).
       # Do NOT pin DB_PATH: Render's filesystem is ephemeral on restarts.

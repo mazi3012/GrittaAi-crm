@@ -33,6 +33,7 @@ import os
 import re
 import threading
 import time
+from datetime import date, timedelta
 
 import requests
 import telebot
@@ -59,37 +60,44 @@ if not TELEGRAM_TOKEN or not OPENROUTER_API_KEY:
     raise ValueError("Error: TELEGRAM_TOKEN or OPENROUTER_API_KEY missing from .env!")
 
 from db import (  # noqa: E402  (after env validation)
+    CLOSER_STATUSES,
+    OLD_TO_STATUS,
+    STATUSES,
+    YESNO,
+    add_lead,
     all_bot_users,
     all_leads,
-    allowed_transitions,
     bot_user_allowed,
+    dashboard_stats,
+    delete_lead,
     find_bot_user,
     get_lead,
-    leads_for_owner,
     normalize_username,
-    save_lead,
+    profile_link_for,
     set_bot_user_authorized,
-    set_lead_stage,
+    today_str,
     track_bot_user,
+    update_lead,
 )
+import sheets  # noqa: E402  Google Sheets mirror (no-op unless configured)
 
 MAX_IMAGE_DIM = 1600      # px - screenshots scaled for fast vision encoding
 MAX_SUMMARY_CHARS = 500   # cap stored summary length
 TG_MSG_LIMIT = 3900       # split long replies (Telegram hard-caps at 4096)
 
-STAGES = ["New", "Contacted", "Meeting Booked", "Converted", "Cancelled", "Lost"]
-SCORE_EMOJI = {"HIGH": "🔥", "MEDIUM": "🟡", "LOW": "🧊"}
-STAGE_EMOJI = {
-    "New": "🆕", "Contacted": "📨", "Meeting Booked": "📅",
-    "Converted": "🏆", "Cancelled": "🚫", "Lost": "❌",
+STATUS_EMOJI = {
+    "Message Sent": "📨", "Seen Not Replied": "👀", "Replied": "💬",
+    "Follow up 1": "1️⃣", "Follow up 2": "2️⃣", "Follow up 3": "3️⃣",
+    "Follow up 4": "4️⃣", "Replied-No yet booked": "🤔", "Closing Call": "📞",
+    "Number received": "☎️", "Discovery Call booked": "📅",
+    "Not Interested": "🚫", "Lost": "❌", "Won": "🏆",
 }
-# Customer-facing names: a CONVERTED deal is an ACTIVE CLIENT of the service.
-STAGE_LABEL = {"Converted": "Active Client"}
 
 
-def stage_display(stage):
-    """Human-friendly stage name ('Converted' -> 'Active Client')."""
-    return STAGE_LABEL.get(stage, stage)
+def status_chip(status):
+    """'💬 Replied' label used across cards, lists and toasts."""
+    s = status or "Message Sent"
+    return f"{STATUS_EMOJI.get(s, '▫️')} {s}"
 
 
 CHAT_MEMORY_TURNS = 6     # user+assistant exchanges kept per chat
@@ -181,8 +189,11 @@ def member_callback(fn):
 _chat_history = {}
 _chat_lock = threading.Lock()
 _typing_stop: dict = {}  # chat_id -> threading.Event (per-chat, no cross-user races)
-# chat_id -> "check" | "claim": set when we asked the user for a @username
+# chat_id -> "check" | "num:@u" | "note:@u" | "next:@u": awaiting a reply
 _pending_prompts = {}
+# chat_id -> {"step": "username|name|followers|note", "data": {...}}:
+# guided /addlead flow state
+_pending_add = {}
 # chat_id -> {"photo_message_id", "text", "target"}: screenshots waiting for
 # the user to pick Log/Summarize/Advice (and/or supply the client username).
 _pending_shots = {}
@@ -213,10 +224,10 @@ def main_menu_kb():
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
         types.InlineKeyboardButton("🗂 My Leads", callback_data="menu:leads"),
-        types.InlineKeyboardButton("🔎 Check Lead", callback_data="ask:check"),
+        types.InlineKeyboardButton("➕ Add Lead", callback_data="ask:add"),
     )
     kb.add(
-        types.InlineKeyboardButton("🤝 Claim Lead", callback_data="ask:claim"),
+        types.InlineKeyboardButton("📊 Team Stats", callback_data="menu:stats"),
         types.InlineKeyboardButton("💬 Talk to Gretta", callback_data="ask:chat"),
     )
     if DASHBOARD_URL:
@@ -233,13 +244,12 @@ def home_button_kb():
 def welcome_text(name):
     return (
         f"👋 <b>Welcome, {esc(name)}!</b>\n\n"
-        "I'm <b>Gretta AI</b> — your CRM copilot.\n\n"
-        "📸 <b>Send a screenshot</b> of any sales chat and I'll extract the "
-        "lead, score it and log it automatically.\n\n"
+        "I'm <b>Gretta AI</b> — your Instagram outreach CRM copilot.\n\n"
         "<b>What you can do:</b>\n"
-        "• 🗂 Browse / manage <b>your</b> leads with tap buttons\n"
-        "• 🔎 <b>/check @user</b> — see who owns a lead\n"
-        "• 🤝 <b>/claim @user</b> — claim a lead\n"
+        "• ➕ <b>/addlead</b> — log a new prospect (guided)\n"
+        "• 🗂 <b>/myleads</b> — browse & manage your leads\n"
+        "• 📊 <b>/stats</b> — team pipeline at a glance\n"
+        "• 🔄 <b>/importsheet</b> — pull your Google Sheet into the CRM\n"
         "• 💬 Or just <b>talk to me</b> — ask anything!\n\n"
         "👇 Use the buttons below or type a command."
     )
@@ -250,10 +260,16 @@ def register_bot_commands():
     try:
         bot.set_my_commands([
             types.BotCommand("start", "Open the Gretta app menu"),
-            types.BotCommand("leads", "Show my leads"),
-            types.BotCommand("check", "Check a lead — /check @username"),
-            types.BotCommand("claim", "Claim a lead — /claim @username"),
+            types.BotCommand("addlead", "Log a new lead — /addlead"),
+            types.BotCommand("myleads", "Show my leads"),
+            types.BotCommand("lead", "Open a lead — /lead @username"),
+            types.BotCommand("status", "Set status — /status @user <status>"),
+            types.BotCommand("note", "Append a note — /note @user <text>"),
+            types.BotCommand("number", "Save a number — /number @user <num>"),
+            types.BotCommand("fup", "Follow-up done — /fup @user <1-4>"),
             types.BotCommand("stats", "Team pipeline summary"),
+            types.BotCommand("importsheet", "Pull leads from Google Sheet"),
+            types.BotCommand("syncsheet", "Push CRM to Google Sheet"),
             types.BotCommand("users", "Audit who is using the bot (team)"),
             types.BotCommand("allow", "Whitelist a user — /allow <id>"),
             types.BotCommand("deny", "Revoke a user — /deny <id>"),
@@ -460,91 +476,113 @@ def sender_handle(message):
 
 
 def lead_card(lead):
-    """Render a lead row as an HTML card (row = db.get_lead tuple order)."""
-    username, owner, status, score, platform = lead[0], lead[1], lead[2], lead[3], lead[4]
-    next_steps, summary, updated = lead[5], lead[6], lead[7]
-    score_tag = SCORE_EMOJI.get(score, "⚪️")
-    stage_tag = STAGE_EMOJI.get(status, "•")
-    lock_tag = " 🔒" if status in ("Converted", "Cancelled") else ""
-    return (
-        f"👤 <b>{esc(username)}</b>  {score_tag} <i>{esc(score)}</i>\n"
-        f"{stage_tag} Stage: <b>{esc(stage_display(status or 'New'))}</b>{lock_tag}\n"
-        f"📱 Platform: {esc(platform or 'Instagram')}\n"
-        f"🧑‍💼 Owner: <b>{esc(owner) if owner else 'Unclaimed'}</b>\n"
-        f"🎯 Next: {esc(next_steps or 'Review lead')}\n"
-        f"🕒 Updated: {esc(updated or '-')}\n\n"
-        f"💡 {esc(summary) if summary else '<i>No summary yet</i>'}"
-    )
+    """Render a lead dict (db.get_lead) as an HTML card."""
+    uname = lead["user_name"]
+    link = lead["profile_link"] or profile_link_for(uname)
+    lines = [
+        f"{status_chip(lead['status'])}  <b>{esc(lead['full_name'] or uname)}</b> "
+        f"{esc(uname)} · #{lead['lead_number']}",
+        f"🧑‍💼 Setter: <b>{esc(lead['sender_name'] or 'Unassigned')}</b>",
+    ]
+    if lead["followers_count"]:
+        lines.append(f"👥 Followers: {esc(lead['followers_count'])}")
+    lines.append(f"🔗 {esc(link)}")
+    touch = " · ".join(filter(None, [
+        f"1st: {lead['first_touchpoint']}" if lead["first_touchpoint"] else "",
+        f"last: {lead['last_touchpoint']}" if lead["last_touchpoint"] else "",
+        f"next: {lead['next_touchpoint']}" if lead["next_touchpoint"] else "",
+    ]))
+    if touch:
+        lines.append(f"🕒 {esc(touch)}")
+    flags = []
+    if lead["replied"] == "Yes":
+        flags.append("💬 replied")
+    if lead["number_received"] == "Yes":
+        flags.append(f"☎️ {lead['number']}" if lead["number"] else "☎️ number in")
+    for n in (1, 2, 3, 4):
+        if lead[f"follow_up_{n}"] == "Yes":
+            when = lead[f"follow_up_{n}_date"]
+            flags.append(f"🔁 FU{n} ✓{(' ' + when) if when else ''}")
+    if lead["discovery_call"] == "Yes":
+        when = f" {lead['discovery_date']}" if lead["discovery_date"] else ""
+        flags.append(f"📅 discovery{when}")
+    if lead["closing_call_status"]:
+        flags.append(f"📞 {lead['closing_call_status']}")
+    if lead["closed_result"]:
+        flags.append(f"🏁 {lead['closed_result']}")
+    if flags:
+        lines.append("✨ " + " · ".join(esc(f) for f in flags))
+    lines.append(
+        f"📝 {esc(lead['note']) if lead['note'] else '<i>No note yet</i>'}")
+    return "\n".join(lines)
 
 
-def stage_kb(username):
-    """Stage buttons tailored to the lead's current pipeline position.
-
-    An ACTIVE CLIENT (Converted) is locked: the only change offered is an
-    explicit 🚫 Cancel Deal. A Cancelled client can only be re-activated.
-    Open leads can move to any legal next stage (db.STAGE_TRANSITIONS).
-    """
+def status_kb(user_name):
+    """Full management keyboard: every status + quick actions."""
     kb = types.InlineKeyboardMarkup(row_width=3)
-    lead = get_lead(username)
-    current = (lead[2] if lead else None) or "New"
-
-    if current == "Converted":
-        kb.add(types.InlineKeyboardButton(
-            f"🏆 {stage_display(current)} ✅", callback_data="noop"))
-        kb.add(types.InlineKeyboardButton(
-            "🚫 Cancel Deal", callback_data=f"stage:{username}:Cancelled"))
-    elif current == "Cancelled":
-        kb.add(types.InlineKeyboardButton(
-            "♻️ Re-activate (Active Client)",
-            callback_data=f"stage:{username}:Converted"))
-    else:
-        buttons = [types.InlineKeyboardButton(
-            f"{STAGE_EMOJI.get(current, '📍')} {current} ✓",
-            callback_data="noop")]
-        buttons += [
-            types.InlineKeyboardButton(
-                "🏆 Active Client" if s == "Converted" else f"{STAGE_EMOJI[s]} {s}",
-                callback_data=f"stage:{username}:{s}",
-            )
-            for s in allowed_transitions(current)
-        ]
-        kb.add(*buttons)
-    kb.add(types.InlineKeyboardButton("🏠 Home", callback_data="menu:home"))
+    kb.add(*[
+        types.InlineKeyboardButton(
+            f"{STATUS_EMOJI.get(s, '▫️')} {s}",
+            callback_data=f"st:{user_name}:{i}")
+        for i, s in enumerate(STATUSES)
+    ])
+    kb.row(
+        types.InlineKeyboardButton("💬 Replied ✓",
+                                   callback_data=f"act:{user_name}:replied"),
+        types.InlineKeyboardButton("☎️ Number",
+                                   callback_data=f"act:{user_name}:asknum"),
+    )
+    kb.row(
+        types.InlineKeyboardButton("1️⃣ FU1", callback_data=f"act:{user_name}:fup1"),
+        types.InlineKeyboardButton("2️⃣ FU2", callback_data=f"act:{user_name}:fup2"),
+        types.InlineKeyboardButton("3️⃣ FU3", callback_data=f"act:{user_name}:fup3"),
+        types.InlineKeyboardButton("4️⃣ FU4", callback_data=f"act:{user_name}:fup4"),
+    )
+    kb.row(
+        types.InlineKeyboardButton("📝 Note", callback_data=f"act:{user_name}:asknote"),
+        types.InlineKeyboardButton("📅 Next", callback_data=f"act:{user_name}:asknext"),
+        types.InlineKeyboardButton("🙋 Take", callback_data=f"act:{user_name}:take"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("🗑 Delete", callback_data=f"act:{user_name}:del"),
+        types.InlineKeyboardButton("🏠 Home", callback_data="menu:home"),
+    )
     return kb
 
 
-def claim_kb(username):
+def new_lead_kb(username):
+    """Shown for @handles that are not in the CRM yet."""
     kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton(f"🤝 Claim {username}", callback_data=f"claim:{username}"))
+    kb.add(types.InlineKeyboardButton(
+        f"➕ Add {username} as a lead", callback_data=f"act:{username}:add"))
     kb.add(types.InlineKeyboardButton("🏠 Home", callback_data="menu:home"))
     return kb
 
 
 def render_my_leads(rows):
-    """Summarize a teammate's leads -> (text, list of tappable buttons)."""
+    """Summarize a setter's leads -> (text, list of tappable buttons)."""
     header = "🗂 <b>My Leads</b>\n\n"
     if not rows:
         return (
-            header + "You don't own any leads yet.\n"
-            "📸 Send me a screenshot of a sales chat and I'll log your "
-            "first lead!",
+            header + "You don't have any leads yet.\n"
+            "➕ <b>/addlead</b> to log your first prospect — or "
+            "<b>/importsheet</b> to pull your Google Sheet in!",
             [],
         )
     lines = [header]
     buttons = []
     shown = rows[:30]
-    for row in shown:
-        username, status, score = row[0], row[2], row[3]
-        score_e = SCORE_EMOJI.get((score or "").upper(), "▫️")
-        stage_e = STAGE_EMOJI.get(status or "New", "🆕")
+    for lead in shown:
+        chip = status_chip(lead["status"])
+        name = lead["full_name"] or lead["user_name"]
         lines.append(
-            f"• {score_e} <b>{esc(username)}</b> · {stage_e} {esc(status or 'New')}"
+            f"• {chip} · #{lead['lead_number']} <b>{esc(name)}</b> "
+            f"{esc(lead['user_name'])}"
         )
-        cb = f"lead:{username}"
+        cb = f"lead:{lead['user_name']}"
         if len(cb.encode()) <= 64:  # Telegram callback_data hard limit
-            buttons.append(
-                types.InlineKeyboardButton(f"{score_e} {username}", callback_data=cb)
-            )
+            buttons.append(types.InlineKeyboardButton(
+                f"#{lead['lead_number']} {lead['user_name']}", callback_data=cb))
     if len(rows) > len(shown):
         lines.append(
             f"\n<i>…and {len(rows) - len(shown)} more — see the dashboard</i>"
@@ -571,94 +609,406 @@ def send_welcome(message):
     )
 
 
-def run_claim(username, claimer):
-    """Shared claim logic for the command, the reply-flow and the button."""
-    lead = get_lead(username)
-    if lead and lead[1] and lead[1].lower() != claimer.lower():
-        return False, (
-            f"⚠️ Lead {esc(username)} is ALREADY claimed by <b>{esc(lead[1])}</b>!"
-        )
-    save_lead(username=username, claimed_by=claimer, status="Contacted")
-    return True, (
-        f"✅ Lead <b>{esc(normalize_username(username))}</b> claimed by "
-        f"<b>{esc(claimer)}</b> — stage set to 📨 Contacted."
-    )
+def _ask_add_step(chat_id, step=None):
+    """Send the next prompt of the guided /addlead flow."""
+    state = _pending_add.get(chat_id) or {}
+    step = step or state.get("step", "name")
+    prompts = {
+        "username": ("➕ <b>Adding a new lead</b>\n\nWhat's their Instagram "
+                     "<b>@username</b>? (example: <code>@imrahulanjaa</code>)"),
+        "name": "👤 Got it. Now their <b>full name</b>? (or <code>-</code> to skip)",
+        "followers": ("👥 How many <b>followers</b>? (e.g. <code>724</code>, "
+                      "<code>13.5k</code> — or <code>-</code> to skip)"),
+        "note": "📝 Any <b>note</b> about this prospect? (or <code>-</code> to skip)",
+    }
+    bot.send_message(chat_id, prompts[step], parse_mode="HTML")
 
 
-@bot.message_handler(commands=["claim"])
+def _process_add_step(message, state):
+    """Consume one answer of the guided /addlead flow. True when consumed."""
+    chat_id = message.chat.id
+    step, data = state.get("step"), state.setdefault("data", {})
+    text = (message.text or "").strip()
+    if step == "username":
+        found = re.findall(r"@[A-Za-z0-9_]+", text)
+        if not found:
+            bot.send_message(
+                chat_id,
+                "🤔 That doesn't look like a username — send it like "
+                "<code>@john_doe</code>.",
+                parse_mode="HTML",
+            )
+            return True
+        data["user_name"] = found[0].lower()
+        state["step"] = "name"
+        _ask_add_step(chat_id, "name")
+        return True
+    if step == "name":
+        if text and text != "-":
+            data["full_name"] = text
+        state["step"] = "followers"
+        _ask_add_step(chat_id, "followers")
+        return True
+    if step == "followers":
+        if text and text != "-":
+            data["followers_count"] = text
+        state["step"] = "note"
+        _ask_add_step(chat_id, "note")
+        return True
+    if step == "note":
+        if text and text != "-":
+            data["note"] = text
+        _pending_add.pop(chat_id, None)
+        uname = data.get("user_name")
+        if not uname:
+            bot.send_message(
+                chat_id,
+                "⚠️ The lead @username got lost — let's start over with "
+                "/addlead.",
+                parse_mode="HTML", reply_markup=home_button_kb(),
+            )
+            return True
+        try:
+            lead, created = add_lead(
+                full_name=data.get("full_name", ""), user_name=uname,
+                sender_name=sender_handle(message),
+                followers_count=data.get("followers_count", ""),
+                note=data.get("note", ""))
+        except ValueError as exc:
+            bot.send_message(chat_id, f"⚠️ {esc(str(exc))}",
+                             parse_mode="HTML", reply_markup=home_button_kb())
+            return True
+        if created:
+            bot.send_message(
+                chat_id,
+                f"✅ <b>Lead #{lead['lead_number']} added!</b>\n\n{lead_card(lead)}",
+                parse_mode="HTML", reply_markup=status_kb(uname))
+        else:
+            bot.send_message(
+                chat_id,
+                f"ℹ️ {esc(uname)} is already in the CRM:\n\n{lead_card(lead)}",
+                parse_mode="HTML", reply_markup=status_kb(uname))
+        return True
+    return False
+
+
+@bot.message_handler(commands=["addlead"])
 @member_only
-def handle_claim(message):
-    parts = (message.text or "").split()
-    if len(parts) < 2:
-        _pending_prompts[message.chat.id] = "claim"
-        bot.send_message(
-            message.chat.id,
-            "🤝 <b>Claim a lead</b>\n\nWhich @username? For example: <code>@john_doe</code>",
-            parse_mode="HTML",
-        )
+def handle_addlead(message):
+    """Guided lead creation: @username -> name -> followers -> note."""
+    chat_id = message.chat.id
+    parts = (message.text or "").split(maxsplit=1)
+    target = None
+    if len(parts) > 1:
+        found = re.findall(r"@[A-Za-z0-9_]+", parts[1])
+        target = found[0].lower() if found else None
+    if target:
+        _pending_add[chat_id] = {"step": "name", "data": {"user_name": target}}
+        _ask_add_step(chat_id, "name")
         return
-    ok, text = run_claim(parts[1], sender_handle(message))
-    bot.send_message(message.chat.id, text, parse_mode="HTML",
-                     reply_markup=home_button_kb())
+    _pending_add[chat_id] = {"step": "username", "data": {}}
+    _ask_add_step(chat_id, "username")
 
 
-@bot.message_handler(commands=["check"])
+@bot.message_handler(commands=["lead", "check"])
 @member_only
-def handle_check(message):
+def handle_lead(message):
     parts = (message.text or "").split()
     if len(parts) < 2:
         _pending_prompts[message.chat.id] = "check"
         bot.send_message(
             message.chat.id,
-            "🔎 <b>Check a lead</b>\n\nWhich @username? For example: <code>@john_doe</code>",
+            "🔎 <b>Open a lead</b>\n\nWhich @username? For example: "
+            "<code>@john_doe</code>",
             parse_mode="HTML",
         )
         return
     show_lead_record(message.chat.id, parts[1])
 
 
-@bot.message_handler(commands=["leads"])
+def my_leads_for(viewer):
+    """A setter's leads: exact sender match first, then first-name match."""
+    rows = all_leads()
+    view = (viewer or "").strip().lower()
+    exact = [r for r in rows if (r["sender_name"] or "").strip().lower() == view]
+    if exact or not view:
+        return exact
+    first = view.lstrip("@")
+    return [r for r in rows
+            if (r["sender_name"] or "").strip().lower().lstrip("@").startswith(first)]
+
+
+@bot.message_handler(commands=["leads", "myleads"])
 @member_only
 def handle_leads(message):
     viewer = sender_handle(message)
-    rows = leads_for_owner(viewer)
+    rows = my_leads_for(viewer)
     text, btns = render_my_leads(rows)
     bot.send_message(message.chat.id, text, parse_mode="HTML",
                      reply_markup=leads_kb(btns))
 
 
+def _target_from(message):
+    """'/cmd @user rest…' -> ('@user', ['rest', '…']) or (None, …)."""
+    parts = (message.text or "").split()
+    if len(parts) >= 2:
+        found = re.findall(r"@[A-Za-z0-9_]+", parts[1])
+        if found:
+            return normalize_username(found[0]), parts[2:]
+    return None, parts[2:] if len(parts) > 2 else []
+
+
+@bot.message_handler(commands=["status"])
+@member_only
+def handle_status(message):
+    """'/status @user Replied' — quick status change (prefix match ok)."""
+    target, rest = _target_from(message)
+    if not target:
+        bot.send_message(
+            message.chat.id,
+            "Usage: <code>/status @user Replied</code>\n\nValid statuses:\n"
+            + "\n".join(f"• {s}" for s in STATUSES),
+            parse_mode="HTML", reply_markup=home_button_kb(),
+        )
+        return
+    if not rest:
+        show_lead_record(message.chat.id, target)
+        return
+    wanted = " ".join(rest).strip().lower()
+    match = next((s for s in STATUSES if s.lower() == wanted), None) or \
+        next((s for s in STATUSES if s.lower().startswith(wanted)), None)
+    if not match:
+        bot.send_message(
+            message.chat.id,
+            f"🤔 No status matches “{esc(' '.join(rest))}”.\nValid: "
+            + ", ".join(STATUSES),
+            parse_mode="HTML", reply_markup=home_button_kb(),
+        )
+        return
+    try:
+        lead = update_lead(target, status=match)
+    except ValueError as exc:
+        bot.send_message(message.chat.id, f"⚠️ {esc(str(exc))}", parse_mode="HTML")
+        return
+    if not lead:
+        show_lead_record(message.chat.id, target)
+        return
+    bot.send_message(message.chat.id,
+                     f"✅ {esc(target)} → <b>{status_chip(match)}</b>",
+                     parse_mode="HTML", reply_markup=home_button_kb())
+
+
+@bot.message_handler(commands=["note"])
+@member_only
+def handle_note(message):
+    """'/note @user text' — append to the lead's note."""
+    target, rest = _target_from(message)
+    text = " ".join(rest).strip()
+    if not target or not text:
+        bot.send_message(
+            message.chat.id,
+            "Usage: <code>/note @user asked for price, follow up friday</code>",
+            parse_mode="HTML")
+        return
+    lead = get_lead(target)
+    if not lead:
+        show_lead_record(message.chat.id, target)
+        return
+    merged = f"{lead['note']} | {text}" if lead["note"] else text
+    lead = update_lead(target, note=merged[:2000])
+    bot.send_message(message.chat.id,
+                     f"📝 Note saved for {esc(target)}:\n{esc(lead['note'])}",
+                     parse_mode="HTML", reply_markup=home_button_kb())
+
+
+def stats_text():
+    """Team pipeline summary (also used by the 📊 Team Stats menu button)."""
+    s = dashboard_stats()
+    if not s["total"]:
+        return ("📭 The CRM is empty — <b>/addlead</b> to log your first "
+                "prospect or <b>/importsheet</b> to pull your Google Sheet!")
+    lines = ["📊 <b>Team Pipeline</b>\n"]
+    for status in STATUSES:
+        n = s["by_status"].get(status, 0)
+        if n:
+            bar = "█" * min(n, 20)
+            lines.append(f"{STATUS_EMOJI.get(status, '▫️')} <b>{status}</b>: {n} {bar}")
+    lines.append("")
+    for name, bucket in s["setters"].items():
+        lines.append(f"🧑‍💼 <b>{esc(name)}</b>: {bucket['total']} leads")
+    lines.append("")
+    lines.append(f"Total: <b>{s['total']}</b> · 🔥 Warm: <b>{s['warm']}</b> · "
+                 f"🏆 Won: <b>{s['won']}</b> · 🚫 Lost/NI: <b>{s['lost']}</b>")
+    return "\n".join(lines)
+
+
+@bot.message_handler(commands=["number"])
+@member_only
+def handle_number(message):
+    """'/number @user 9876543210' — save the phone (auto Number Received ✓)."""
+    target, rest = _target_from(message)
+    number = " ".join(rest).strip()
+    if not target or not number:
+        bot.send_message(message.chat.id,
+                         "Usage: <code>/number @user 9876543210</code>",
+                         parse_mode="HTML")
+        return
+    lead = update_lead(target, number=number[:40])
+    if not lead:
+        show_lead_record(message.chat.id, target)
+        return
+    bot.send_message(message.chat.id,
+                     f"☎️ <code>{esc(number[:40])}</code> saved for "
+                     f"{esc(target)} — <b>Number Received ✓</b>",
+                     parse_mode="HTML", reply_markup=home_button_kb())
+
+
+@bot.message_handler(commands=["fup"])
+@member_only
+def handle_fup(message):
+    """'/fup @user 2' — mark follow-up N done (dates today, advances status)."""
+    target, rest = _target_from(message)
+    n = rest[0] if rest else ""
+    if not target or n not in ("1", "2", "3", "4"):
+        bot.send_message(message.chat.id,
+                         "Usage: <code>/fup @user 2</code>  (1-4)",
+                         parse_mode="HTML")
+        return
+    current = (get_lead(target) or {}).get("status", "")
+    fields = {f"follow_up_{n}": "Yes"}
+    if current in ("Message Sent", "Seen Not Replied", "Replied",
+                   f"Follow up {n}") or not current:
+        fields["status"] = f"Follow up {n}"
+    lead = update_lead(target, **fields)
+    if not lead:
+        show_lead_record(message.chat.id, target)
+        return
+    bot.send_message(message.chat.id,
+                     f"🔁 Follow up {n} marked done for {esc(target)} "
+                     f"({today_str()}) → <b>{status_chip(lead['status'])}</b>",
+                     parse_mode="HTML", reply_markup=home_button_kb())
+
+
+@bot.message_handler(commands=["next"])
+@member_only
+def handle_next(message):
+    """'/next @user friday' — set the Next Touchpoint date."""
+    target, rest = _target_from(message)
+    when = _parse_next_date(" ".join(rest))
+    if not target or not when:
+        bot.send_message(message.chat.id,
+                         "Usage: <code>/next @user 2026-09-01</code> "
+                         "(or 'tomorrow', 'friday'…)",
+                         parse_mode="HTML")
+        return
+    lead = update_lead(target, next_touchpoint=when)
+    if not lead:
+        show_lead_record(message.chat.id, target)
+        return
+    bot.send_message(message.chat.id,
+                     f"📅 Next touchpoint for {esc(target)}: <b>{when}</b>",
+                     parse_mode="HTML", reply_markup=home_button_kb())
+
+
+def _parse_next_date(text):
+    """Accept YYYY-MM-DD, d/m, 'today', 'tomorrow' or weekday names."""
+    t = (text or "").strip().lower()
+    today = date.today()
+    if t == "today":
+        return today.strftime("%Y-%m-%d")
+    if t in ("tomorrow", "tmr"):
+        return (today + timedelta(days=1)).strftime("%Y-%m-%d")
+    weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday",
+                "saturday", "sunday"]
+    if t in weekdays:
+        delta = (weekdays.index(t) - today.weekday()) % 7 or 7
+        return (today + timedelta(days=delta)).strftime("%Y-%m-%d")
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", t)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)),
+                        int(m.group(3))).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+    m = re.fullmatch(r"(\d{1,2})[/.-](\d{1,2})(?:[/.-](\d{2,4}))?", t)
+    if m:  # d/m or d/m/y (day-first, like the sheet)
+        dd, mm = int(m.group(1)), int(m.group(2))
+        yy = int(m.group(3)) if m.group(3) else today.year
+        if yy < 100:
+            yy += 2000
+        try:
+            return date(yy, mm, dd).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+    return None
+
+
 @bot.message_handler(commands=["stats"])
 @member_only
 def handle_stats(message):
-    rows = all_leads()
-    total = len(rows)
-    if not total:
+    bot.send_message(message.chat.id, stats_text(), parse_mode="HTML",
+                     reply_markup=home_button_kb())
+
+
+@bot.message_handler(commands=["syncsheet"])
+@member_only
+def handle_syncsheet(message):
+    """Force-push the full leads table to the team Google Sheet backup."""
+    chat_id = message.chat.id
+    if not sheets.configured():
         bot.send_message(
-            message.chat.id,
-            "📭 The CRM is empty — send me a 📸 screenshot to log your "
-            "first lead!",
+            chat_id,
+            "🔗 <b>Google Sheets backup isn't set up yet.</b>\n\n"
+            "Add <code>GOOGLE_SHEET_WEBAPP_URL</code> (and optionally "
+            "<code>GOOGLE_SHEET_SECRET</code>) to your environment — full "
+            "walkthrough in README.md → “Google Sheets backup”. Until then "
+            "I sync nothing.",
+            parse_mode="HTML",
             reply_markup=home_button_kb(),
         )
         return
-    by_stage = {}
-    for row in rows:
-        stage = row[2] or "New"
-        by_stage[stage] = by_stage.get(stage, 0) + 1
-    unclaimed = sum(1 for row in rows if not row[1])
-    hot = sum(1 for row in rows if (row[3] or "").upper() == "HIGH")
-    lines = ["📊 <b>Team Pipeline</b>\n"]
-    for stage in STAGES:
-        n = by_stage.get(stage, 0)
-        bar = "█" * n if n else ""
-        lines.append(f"{STAGE_EMOJI.get(stage, '▫️')} <b>{stage_display(stage)}</b>: {n} {bar}")
-    lines.append("")
-    lines.append(f"Total leads: <b>{total}</b>")
-    lines.append(f"🏆 Active Clients: <b>{by_stage.get('Converted', 0)}</b>")
-    lines.append(f"🚫 Cancelled clients: <b>{by_stage.get('Cancelled', 0)}</b>")
-    lines.append(f"🔥 Hot (HIGH score): <b>{hot}</b>")
-    lines.append(f"🟢 Unclaimed: <b>{unclaimed}</b>")
-    bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML",
-                     reply_markup=home_button_kb())
+    notice = bot.send_message(chat_id, "⏳ Pushing CRM → Google Sheet…")
+    ok, detail = sheets.push_now()
+    if ok:
+        text = f"✅ <b>Sheet synced!</b> {esc(detail)}"
+    else:
+        text = f"⚠️ <b>Sheet sync failed:</b> {esc(detail)}"
+    try:
+        bot.edit_message_text(
+            text, chat_id, notice.message_id,
+            parse_mode="HTML", reply_markup=home_button_kb(),
+        )
+    except Exception:
+        bot.send_message(chat_id, text, parse_mode="HTML",
+                         reply_markup=home_button_kb())
+
+
+@bot.message_handler(commands=["importsheet"])
+@member_only
+def handle_importsheet(message):
+    """Pull every data tab from the Google Sheet into the CRM."""
+    chat_id = message.chat.id
+    if not sheets.configured():
+        bot.send_message(
+            chat_id,
+            "🔗 <b>Google Sheets isn't set up yet.</b>\n\n"
+            "Add <code>GOOGLE_SHEET_WEBAPP_URL</code> (and "
+            "<code>GOOGLE_SHEET_SECRET</code>) to your environment — full "
+            "walkthrough in README.md → “Google Sheets mirror”.",
+            parse_mode="HTML",
+            reply_markup=home_button_kb(),
+        )
+        return
+    notice = bot.send_message(chat_id, "⏳ Pulling Google Sheet → CRM…")
+    ok, detail = sheets.pull_now()
+    text = f"✅ <b>Import done!</b> {esc(detail)}" if ok else \
+        f"⚠️ <b>Import failed:</b> {esc(detail)}"
+    try:
+        bot.edit_message_text(text, chat_id, notice.message_id,
+                              parse_mode="HTML", reply_markup=home_button_kb())
+    except Exception:
+        bot.send_message(chat_id, text, parse_mode="HTML",
+                         reply_markup=home_button_kb())
 
 
 @bot.message_handler(commands=["help"])
@@ -667,18 +1017,22 @@ def handle_help(message):
     bot.send_message(
         message.chat.id,
         "<b>How to use Gretta AI</b> 🤖\n\n"
-        "📸 <b>Log a lead:</b> just send a screenshot of any sales chat "
-        "(WhatsApp, Instagram, LinkedIn…). I read it, score the lead and "
-        "save it — no typing needed.\n\n"
-        "<b>Commands</b>\n"
-        "/leads — browse <i>your</i> leads with tappable cards\n"
-        "/check @user — see who owns a lead\n"
-        "/claim @user — claim a lead for yourself\n"
-        "/stats — team pipeline at a glance\n\n"
-        "💬 <b>Talk to me:</b> type anything — negotiation tips, pipeline "
-        "questions, follow-up ideas.\n"
-        "⚡️ <b>Shortcuts:</b> tap a lead button to open its card, then tap "
-        "a stage to move the deal.",
+        "<b>Manage your Instagram outreach:</b>\n"
+        "/addlead — log a new prospect (guided)\n"
+        "/myleads — browse <i>your</i> leads with tappable cards\n"
+        "/lead @user — open a lead's full card\n"
+        "/status @user &lt;status&gt; — quick status change\n"
+        "/note @user &lt;text&gt; — append a note\n"
+        "/number @user &lt;number&gt; — save their phone number\n"
+        "/fup @user &lt;1-4&gt; — mark a follow-up as done\n"
+        "/next @user &lt;date&gt; — set the next touchpoint\n"
+        "/stats — team pipeline at a glance\n"
+        "/importsheet — pull your Google Sheet into the CRM\n"
+        "/syncsheet — push the CRM to your Google Sheet\n\n"
+        "💬 <b>Talk to me:</b> type anything — outreach tips, follow-up "
+        "ideas, pipeline questions.\n"
+        "⚡️ <b>Shortcuts:</b> tap a lead to open its card, then tap a "
+        "status or action button.",
         parse_mode="HTML",
         reply_markup=main_menu_kb(),
     )
@@ -690,14 +1044,14 @@ def show_lead_record(chat_id, username):
         uname = normalize_username(username) or username
         bot.send_message(
             chat_id,
-            f"🟢 <b>{esc(uname)}</b> is brand new — not in the CRM yet. "
-            "Nobody has touched this lead!",
+            f"🟢 <b>{esc(uname)}</b> is not in the CRM yet — nobody has "
+            "touched this prospect!",
             parse_mode="HTML",
-            reply_markup=claim_kb(uname),
+            reply_markup=new_lead_kb(uname),
         )
         return
     bot.send_message(chat_id, lead_card(lead), parse_mode="HTML",
-                     reply_markup=stage_kb(lead[0]))
+                     reply_markup=status_kb(lead["user_name"]))
 
 
 def triage_kb(has_target):
@@ -832,30 +1186,37 @@ def analyze_and_reply(status, image_bytes, user_caption, target_user,
     found_score = str(info.get("score", "MEDIUM")).upper()
     if found_score not in ("HIGH", "MEDIUM", "LOW"):
         found_score = "MEDIUM"
-    found_platform = str(info.get("platform", "Instagram")).strip()
     found_stage = str(info.get("stage", "Contacted")).strip()
+    found_status = OLD_TO_STATUS.get(found_stage, "Replied")
     found_next = str(info.get("next_steps", "Follow up with client")).strip()
     found_summary = str(info.get("summary", "Screenshot analyzed")).strip()
     if len(found_summary) > MAX_SUMMARY_CHARS:
         found_summary = found_summary[:MAX_SUMMARY_CHARS].rstrip() + "…"
 
+    note_bits = []
+    if found_score == "HIGH":
+        note_bits.append("AI score: HIGH 🔥")
+    if found_next and found_next.lower() != "follow up with client":
+        note_bits.append(f"Next: {found_next}")
+    note_bits.append(found_summary)
+    note = " | ".join(note_bits)
+
     # Never steal a lead another teammate already owns
     existing = get_lead(found_user)
-    owner = existing[1] if (existing and existing[1]) else (owner or "Unclaimed")
+    setter = (existing or {}).get("sender_name") or owner or "Unassigned"
+    if existing:
+        merged = f"{existing['note']} | {note}" if existing["note"] else note
+        fields = {"note": merged[:2000]}
+        if (existing["status"] or "Message Sent") == "Message Sent":
+            fields["status"] = found_status
+        lead = update_lead(found_user, **fields)
+    else:
+        lead, _ = add_lead(full_name="", user_name=found_user,
+                           sender_name=setter, note=note, status=found_status)
 
-    save_lead(
-        username=found_user,
-        claimed_by=owner,
-        lead_score=found_score,
-        platform=found_platform,
-        status=found_stage,
-        next_steps=found_next,
-        summary=found_summary,
-    )
-
-    lead = get_lead(found_user)
     card = lead_card(lead) if lead else f"👤 <b>{esc(found_user)}</b> saved."
-    edit_status(status, f"✅ <b>Lead logged!</b>\n\n{card}", stage_kb(found_user))
+    edit_status(status, f"✅ <b>Lead logged!</b>\n\n{card}",
+                status_kb(found_user))
 
 
 LAYOUT_NOTE = (
@@ -951,18 +1312,20 @@ def on_menu(call):
         kb = main_menu_kb()
     elif data == "menu:leads":
         viewer = sender_handle(call.message)
-        rows = leads_for_owner(viewer)
+        rows = my_leads_for(viewer)
         text, btns = render_my_leads(rows)
         kb = leads_kb(btns)
-    elif data == "ask:check":
-        _pending_prompts[chat_id] = "check"
-        bot.send_message(chat_id, "🔎 Send me the @username to check:",
-                         parse_mode="HTML")
+    elif data == "menu:stats":
+        text = stats_text()
+        kb = home_button_kb()
+    elif data == "ask:add":
+        _pending_add[chat_id] = {"step": "username", "data": {}}
+        _ask_add_step(chat_id, "username")
         bot.answer_callback_query(call.id)
         return
-    elif data == "ask:claim":
-        _pending_prompts[chat_id] = "claim"
-        bot.send_message(chat_id, "🤝 Send me the @username to claim:",
+    elif data == "ask:check":
+        _pending_prompts[chat_id] = "check"
+        bot.send_message(chat_id, "🔎 Send me the @username to open:",
                          parse_mode="HTML")
         bot.answer_callback_query(call.id)
         return
@@ -995,59 +1358,124 @@ def on_lead_card(call):
     try:
         bot.edit_message_text(lead_card(lead), call.message.chat.id,
                               call.message.message_id, parse_mode="HTML",
-                              reply_markup=stage_kb(username))
+                              reply_markup=status_kb(lead["user_name"]))
     except Exception as exc:
         if "message is not modified" not in str(exc).lower():
             bot.send_message(call.message.chat.id, lead_card(lead),
-                             parse_mode="HTML", reply_markup=stage_kb(username))
+                             parse_mode="HTML",
+                             reply_markup=status_kb(lead["user_name"]))
     bot.answer_callback_query(call.id)
 
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("stage:"))
+@bot.callback_query_handler(func=lambda c: c.data.startswith("st:"))
 @member_callback
-def on_stage_change(call):
+def on_status_change(call):
     try:
-        _, username, new_stage = call.data.split(":", 2)
-    except ValueError:
+        _, username, idx = call.data.split(":", 2)
+        new_status = STATUSES[int(idx)]
+    except (ValueError, IndexError):
         bot.answer_callback_query(call.id, "Invalid action.")
         return
-    if new_stage not in STAGES:
-        bot.answer_callback_query(call.id, "Unknown stage.")
+    try:
+        lead = update_lead(username, status=new_status)
+    except ValueError as exc:
+        bot.answer_callback_query(call.id, str(exc)[:190], show_alert=True)
         return
-    if not set_lead_stage(username, new_stage):
-        bot.answer_callback_query(
-            call.id,
-            "🔒 Locked. Active Clients can only be cancelled; cancelled "
-            "clients can only be re-activated.",
-            show_alert=True,
-        )
+    if not lead:
+        bot.answer_callback_query(call.id, "Lead no longer exists.", show_alert=True)
         return
-    lead = get_lead(username)
-    toast = (f"{STAGE_EMOJI.get(new_stage, '✅')} "
-             f"{normalize_username(username)} → {stage_display(new_stage)}")
     try:
         bot.edit_message_text(lead_card(lead), call.message.chat.id,
                               call.message.message_id, parse_mode="HTML",
-                              reply_markup=stage_kb(username))
+                              reply_markup=status_kb(username))
     except Exception:
         pass
-    bot.answer_callback_query(call.id, toast)
+    bot.answer_callback_query(call.id,
+                              f"{STATUS_EMOJI.get(new_status, '✅')} {new_status}")
 
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("claim:"))
+@bot.callback_query_handler(func=lambda c: c.data.startswith("act:"))
 @member_callback
-def on_claim_button(call):
-    username = call.data[len("claim:"):]
-    claimer = sender_handle(call.message)
-    ok, text = run_claim(username, claimer)
-    bot.send_message(call.message.chat.id, text, parse_mode="HTML",
-                     reply_markup=home_button_kb() if ok else None)
-    if ok:
-        lead = get_lead(username)
-        if lead:
-            bot.send_message(call.message.chat.id, lead_card(lead),
-                             parse_mode="HTML", reply_markup=stage_kb(lead[0]))
-    bot.answer_callback_query(call.id)
+def on_lead_action(call):
+    """Quick actions: replied / follow-ups / number / note / next / take / del."""
+    try:
+        _, username, action = call.data.split(":", 2)
+    except ValueError:
+        bot.answer_callback_query(call.id, "Invalid action.")
+        return
+    chat_id = call.message.chat.id
+    lead = None
+    if action == "replied":
+        current = (get_lead(username) or {}).get("status", "")
+        fields = {"replied": "Yes"}
+        if current in ("Message Sent", "Seen Not Replied", ""):
+            fields["status"] = "Replied"
+        lead = update_lead(username, **fields)
+        toast = "💬 Marked as replied"
+    elif action.startswith("fup") and action[-1] in "1234":
+        n = action[-1]
+        current = (get_lead(username) or {}).get("status", "")
+        fields = {f"follow_up_{n}": "Yes"}
+        if current in ("Message Sent", "Seen Not Replied", "Replied",
+                       f"Follow up {n}", ""):
+            fields["status"] = f"Follow up {n}"
+        lead = update_lead(username, **fields)
+        toast = f"🔁 Follow up {n} done"
+    elif action == "take":
+        lead = update_lead(username, sender_name=sender_handle(call.message))
+        toast = f"🙋 Taken by {sender_handle(call.message)}"
+    elif action == "del":
+        delete_lead(username)
+        try:
+            bot.edit_message_text(
+                f"🗑 <b>{esc(username)}</b> deleted from the CRM.",
+                chat_id, call.message.message_id, parse_mode="HTML",
+                reply_markup=home_button_kb())
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id, "🗑 Deleted")
+        return
+    elif action == "add":
+        _pending_add[chat_id] = {"step": "name", "data": {"user_name": username}}
+        _ask_add_step(chat_id, "name")
+        bot.answer_callback_query(call.id)
+        return
+    elif action == "asknum":
+        _pending_prompts[chat_id] = f"num:{username}"
+        bot.send_message(chat_id,
+                         f"☎️ Send me <b>{esc(username)}</b>'s phone number:",
+                         parse_mode="HTML")
+        bot.answer_callback_query(call.id)
+        return
+    elif action == "asknote":
+        _pending_prompts[chat_id] = f"note:{username}"
+        bot.send_message(
+            chat_id,
+            f"📝 Send me the note to append for <b>{esc(username)}</b>:",
+            parse_mode="HTML")
+        bot.answer_callback_query(call.id)
+        return
+    elif action == "asknext":
+        _pending_prompts[chat_id] = f"next:{username}"
+        bot.send_message(
+            chat_id,
+            f"📅 Next touchpoint date for <b>{esc(username)}</b>? "
+            "(YYYY-MM-DD, 'tomorrow' or a weekday)",
+            parse_mode="HTML")
+        bot.answer_callback_query(call.id)
+        return
+    else:
+        bot.answer_callback_query(call.id, "Unknown action.")
+        return
+    if not lead:
+        bot.answer_callback_query(call.id, "Lead no longer exists.", show_alert=True)
+        return
+    try:
+        bot.edit_message_text(lead_card(lead), chat_id, call.message.message_id,
+                              parse_mode="HTML", reply_markup=status_kb(username))
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id, toast[:190])
 
 
 # ------------------------------------------------------- screenshot actions
@@ -1237,17 +1665,66 @@ def handle_free_text(message):
             )
             return
 
-    # Waiting for a @username answer from the Check/Claim button flow?
+    # Guided /addlead flow first (multi-step, so it wins over prompts).
+    add_state = _pending_add.get(message.chat.id)
+    if add_state and not user_text.startswith("/"):
+        if _process_add_step(message, add_state):
+            return
+
+    # Waiting for an answer from a lead-card button flow?
     pending = _pending_prompts.pop(message.chat.id, None)
     if re.fullmatch(r"/[A-Za-z0-9_]+.*", user_text):
         _pending_prompts.pop(message.chat.id, None)  # command cancels prompt
     elif pending == "check":
         show_lead_record(message.chat.id, user_text)
         return
-    elif pending == "claim":
-        ok, text = run_claim(user_text, sender_handle(message))
-        bot.send_message(message.chat.id, text, parse_mode="HTML",
-                         reply_markup=home_button_kb() if ok else None)
+    elif isinstance(pending, str) and pending.startswith("num:"):
+        number = user_text.strip()[:40]
+        lead = update_lead(pending[4:], number=number)
+        if lead:
+            bot.send_message(
+                message.chat.id,
+                f"☎️ <code>{esc(number)}</code> saved — "
+                f"<b>Number Received ✓</b>\n\n{lead_card(lead)}",
+                parse_mode="HTML", reply_markup=status_kb(lead["user_name"]))
+        else:
+            bot.send_message(message.chat.id, "🤔 That lead no longer exists.",
+                             reply_markup=home_button_kb())
+        return
+    elif isinstance(pending, str) and pending.startswith("note:"):
+        lead = get_lead(pending[5:])
+        if lead:
+            merged = (f"{lead['note']} | {user_text}"
+                      if lead["note"] else user_text)
+            lead = update_lead(pending[5:], note=merged[:2000])
+        if lead:
+            bot.send_message(
+                message.chat.id,
+                f"📝 Note saved:\n{esc(lead['note'])}\n\n{lead_card(lead)}",
+                parse_mode="HTML", reply_markup=status_kb(lead["user_name"]))
+        else:
+            bot.send_message(message.chat.id, "🤔 That lead no longer exists.",
+                             reply_markup=home_button_kb())
+        return
+    elif isinstance(pending, str) and pending.startswith("next:"):
+        when = _parse_next_date(user_text)
+        if not when:
+            _pending_prompts[message.chat.id] = pending  # let them retry
+            bot.send_message(
+                message.chat.id,
+                "🤔 Couldn't parse that date — try <code>YYYY-MM-DD</code>, "
+                "<code>tomorrow</code> or a weekday name.",
+                parse_mode="HTML")
+            return
+        lead = update_lead(pending[5:], next_touchpoint=when)
+        if lead:
+            bot.send_message(
+                message.chat.id,
+                f"📅 Next touchpoint: <b>{when}</b>\n\n{lead_card(lead)}",
+                parse_mode="HTML", reply_markup=status_kb(lead["user_name"]))
+        else:
+            bot.send_message(message.chat.id, "🤔 That lead no longer exists.",
+                             reply_markup=home_button_kb())
         return
 
     # A bare @username typed alone behaves like /check (handy any time)

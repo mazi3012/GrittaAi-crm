@@ -40,21 +40,18 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from db import (
-    VALID_SCORES,
-    VALID_STAGES,
+from db import (  # noqa: E402
+    CLOSING_CALL_STATUSES,
+    STATUSES,
+    YESNO,
     all_bot_users,
     all_leads,
-    assign_owner,
-    can_move_stage,
     dashboard_stats,
     delete_lead,
     get_lead,
     init_db,
     normalize_username,
-    save_lead,
-    set_bot_user_authorized,
-    set_lead_stage,
+    today_str,
     update_lead,
 )
 
@@ -160,18 +157,13 @@ def api_auth_logout(response: Response):
 
 
 def _lead_dicts():
+    """Full sheet-shaped rows for the SPA (all 27 columns + timestamps)."""
     leads = []
     for row in all_leads():
-        leads.append({
-            "username": row[0],
-            "claimed_by": row[1] or "",
-            "status": row[2] or "New",
-            "score": row[3] or "UNKNOWN",
-            "platform": row[4] or "Instagram",
-            "next_steps": row[5] or "Review lead details",
-            "summary": row[6] or "",
-            "updated": row[7] or "",
-        })
+        lead = dict(row)
+        lead["username"] = lead["user_name"]       # legacy alias used by app.js
+        lead["updated"] = lead.get("updated_at") or ""
+        leads.append(lead)
     return leads
 
 
@@ -183,33 +175,27 @@ def api_leads():
 
 class StageIn(BaseModel):
     username: str = Field(min_length=1, max_length=120)
-    stage: str = Field(min_length=1, max_length=40)
+    stage: str = Field(min_length=1, max_length=40)   # a status name
+
+    @property
+    def status(self) -> str:
+        return self.stage.strip()
 
 
 @app.post("/api/lead/stage")
 def api_set_stage(payload: StageIn):
     uname = normalize_username(payload.username)
-    lead = get_lead(uname)
-    if lead is None:
+    if get_lead(uname) is None:
         return JSONResponse(status_code=404,
                             content={"ok": False, "error": "Lead not found"})
-    current = lead[2] or "New"
-    if payload.stage == current:
-        return {"ok": True}  # no-op move, nothing to do
-    if payload.stage not in VALID_STAGES:
+    if payload.status == (get_lead(uname) or {}).get("status"):
+        return {"ok": True}
+    try:
+        update_lead(uname, status=payload.status)
+    except ValueError as exc:
         return JSONResponse(status_code=400,
-                            content={"ok": False, "error": f"Invalid stage '{payload.stage}'"})
-    if not can_move_stage(current, payload.stage):
-        if current == "Converted":
-            reason = ("🔒 Active Client is locked — the only allowed change "
-                      "is 🚫 Cancel Deal")
-        elif current == "Cancelled":
-            reason = "🔒 Cancelled client — use ♻️ Re-activate to bring them back"
-        else:
-            reason = f"🔒 Cannot move a lead from '{current}' to '{payload.stage}'"
-        return JSONResponse(status_code=409, content={"ok": False, "error": reason})
-    ok = set_lead_stage(uname, payload.stage)
-    return {"ok": ok}
+                            content={"ok": False, "error": str(exc)})
+    return {"ok": True}
 
 
 class OwnerIn(BaseModel):
@@ -224,8 +210,9 @@ def api_set_owner(payload: OwnerIn):
         return JSONResponse(status_code=400, content={"ok": False, "error": "Missing username"})
     if get_lead(uname) is None:
         return JSONResponse(status_code=404, content={"ok": False, "error": "Lead not found"})
-    ok = assign_owner(uname, payload.owner)  # explicit dashboard override
-    return {"ok": bool(ok), "owner": (payload.owner or "").strip() or None}
+    owner = (payload.owner or "").strip() or "Unassigned"
+    update_lead(uname, sender_name=owner)
+    return {"ok": True, "owner": owner}
 
 
 class NoteIn(BaseModel):
@@ -236,72 +223,55 @@ class NoteIn(BaseModel):
 @app.post("/api/lead/note")
 def api_add_note(payload: NoteIn):
     uname = normalize_username(payload.username)
-    if get_lead(uname) is None:
+    lead = get_lead(uname)
+    if lead is None:
         return JSONResponse(status_code=404, content={"ok": False, "error": "Lead not found"})
-    # save_lead appends summaries and never steals the first owner.
-    save_lead(uname, summary=payload.note.strip())
-    return {"ok": True}
-
-
-class NextStepsIn(BaseModel):
-    username: str = Field(min_length=1, max_length=120)
-    next_steps: str = Field(max_length=500, default="")
-
-
-@app.post("/api/lead/next_steps")
-def api_set_next_steps(payload: NextStepsIn):
-    uname = normalize_username(payload.username)
-    if get_lead(uname) is None:
-        return JSONResponse(status_code=404, content={"ok": False, "error": "Lead not found"})
-    save_lead(uname, next_steps=(payload.next_steps.strip() or "Review lead details"))
+    merged = f"{lead['note']} | {payload.note.strip()}" if lead["note"] \
+        else payload.note.strip()
+    update_lead(uname, note=merged[:4000])
     return {"ok": True}
 
 
 class UpdateIn(BaseModel):
+    """Partial edit from the drawer form: only sent fields are changed."""
     username: str = Field(min_length=1, max_length=120)
     status: str | None = Field(default=None, max_length=40)
-    score: str | None = Field(default=None, max_length=20)
-    platform: str | None = Field(default=None, max_length=60)
-    owner: str | None = Field(default=None, max_length=120)
-    next_steps: str | None = Field(default=None, max_length=500)
-    summary: str | None = Field(default=None, max_length=20000)
+    full_name: str | None = Field(default=None, max_length=200)
+    followers_count: str | None = Field(default=None, max_length=60)
+    number: str | None = Field(default=None, max_length=60)
+    note: str | None = Field(default=None, max_length=4000)
+    next_touchpoint: str | None = Field(default=None, max_length=20)
+    replied: str | None = Field(default=None, max_length=4)
+    number_received: str | None = Field(default=None, max_length=4)
+    follow_up_1: str | None = Field(default=None, max_length=4)
+    follow_up_2: str | None = Field(default=None, max_length=4)
+    follow_up_3: str | None = Field(default=None, max_length=4)
+    follow_up_4: str | None = Field(default=None, max_length=4)
+    discovery_call: str | None = Field(default=None, max_length=4)
+    discovery_date: str | None = Field(default=None, max_length=20)
+    closing_call_status: str | None = Field(default=None, max_length=40)
+    closed_result: str | None = Field(default=None, max_length=20)
+
+
+# Fields the drawer may write -> passed straight through to update_lead.
+EDITABLE = set(UpdateIn.model_fields) - {"username"}
 
 
 @app.post("/api/lead/update")
 def api_update_lead(payload: UpdateIn):
-    """Partial edit from the drawer form: only sent fields are changed."""
     uname = normalize_username(payload.username)
-    lead = get_lead(uname)
-    if lead is None:
+    if get_lead(uname) is None:
         return JSONResponse(status_code=404, content={"ok": False, "error": "Lead not found"})
-
-    kwargs = {}
-    if payload.status is not None:
-        if payload.status not in VALID_STAGES:
-            return JSONResponse(status_code=400, content={"ok": False, "error": f"Invalid stage '{payload.status}'"})
-        if payload.status != (lead[2] or "New") and not can_move_stage(lead[2] or "New", payload.status):
-            return JSONResponse(status_code=409, content={"ok": False, "error": (
-                "🔒 Active Client is locked — only 🚫 Cancel Deal is allowed"
-                if (lead[2] or "New") == "Converted"
-                else f"🔒 Cannot move from '{lead[2]}' to '{payload.status}'"
-            )})
-        kwargs["status"] = payload.status
-    if payload.score is not None:
-        if payload.score not in VALID_SCORES:
-            return JSONResponse(status_code=400, content={"ok": False, "error": f"Invalid score '{payload.score}'"})
-        kwargs["lead_score"] = payload.score
-    if payload.platform is not None:
-        if not payload.platform.strip():
-            return JSONResponse(status_code=400, content={"ok": False, "error": "Platform cannot be empty"})
-        kwargs["platform"] = payload.platform.strip()
-    if payload.owner is not None:
-        kwargs["claimed_by"] = payload.owner  # "" -> unclaim
-    if payload.next_steps is not None:
-        kwargs["next_steps"] = payload.next_steps
-    if payload.summary is not None:
-        kwargs["summary"] = payload.summary  # full overwrite (form warns)
-
-    update_lead(uname, **kwargs)
+    fields = {k: v for k, v in payload.model_dump().items()
+              if k in EDITABLE and v is not None}
+    for flag in ("replied", "number_received", "follow_up_1", "follow_up_2",
+                 "follow_up_3", "follow_up_4", "discovery_call"):
+        if flag in fields and fields[flag] not in YESNO:
+            fields[flag] = "Yes" if fields[flag] else ""
+    try:
+        update_lead(uname, **fields)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(exc)})
     return {"ok": True}
 
 
