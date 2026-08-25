@@ -10,7 +10,7 @@ pinned: false
 
 # 🤖 Gretta AI — Telegram CRM Bot & Live Command Center
 
-A Telegram bot that turns chat screenshots into structured CRM leads, paired with a live, modern web dashboard. Built for sales teams that DM prospects on Instagram, WhatsApp, or IndiaMART and need to prevent duplicate outreach.
+A Telegram bot that turns chat screenshots into structured CRM leads, paired with a live, modern web dashboard. Built for sales teams that DM prospects on Instagram, WhatsApp, and need to prevent duplicate outreach.
 
 ## 🚀 Key Features
 
