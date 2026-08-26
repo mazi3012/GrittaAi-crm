@@ -15,13 +15,15 @@ services:
     dockerContext: .
     healthCheckPath: /
     envVars:
-      # ---- REQUIRED (values entered in Render Dashboard, never committed) ----
+      # ---- PROVIDER CREDENTIALS (values entered in Render Dashboard, never committed) ----
       - key: TELEGRAM_TOKEN
         sync: false
       - key: OPENROUTER_API_KEY
         sync: false
 
       # ---- OPTIONAL ----
+      - key: GROQ_API_KEY
+        sync: false
       - key: GEMINI_API_KEY
         sync: false
       - key: DASHBOARD_URL
@@ -35,6 +37,8 @@ services:
         sync: false
       - key: MODEL
         value: stealth/ox-alpha
+      - key: GROQ_MODEL
+        value: qwen/qwen3.6-27b
       # Screenshot analysis uses the same ox-alpha model (vision-capable).
       - key: VISION_MODEL
         value: stealth/ox-alpha

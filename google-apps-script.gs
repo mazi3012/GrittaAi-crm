@@ -4,8 +4,10 @@
  * ─────────────────────────────────────────────────────────────────────────────
  *  SETUP (one time, ~3 minutes):
  *  1. Open "CRM - Instagram Data" → Extensions → Apps Script.
- *  2. Delete the sample code, paste THIS entire file, set SECRET below to the
- *     SAME value as GOOGLE_SHEET_SECRET in the bot's environment.
+ *  2. Delete the sample code and paste THIS entire file. In Apps Script,
+ *     open Project Settings → Script Properties and add:
+ *       GOOGLE_SHEET_SECRET = the same value used by the bot
+ *       SPREADSHEET_ID = your spreadsheet ID
  *  3. Deploy → New deployment → type: Web app
  *     - Execute as: Me
  *     - Who has access: Anyone          ← required; the secret is the real gate
@@ -22,10 +24,19 @@
  *  tab except "Sync Log", using DISPLAY values (dates come back "23 Aug").
  */
 
-const SECRET = 'PASTE_YOUR_GOOGLE_SHEET_SECRET_HERE';
+// Store these values in Apps Script Project Settings / Script Properties.
+// Do not commit live credentials to this file.
+const SECRET = PropertiesService.getScriptProperties().getProperty('GOOGLE_SHEET_SECRET') || '';
+const SPREADSHEET_ID = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
 const LOG_SHEET = 'Sync Log';
 const CLOSER_TAB = 'Closer';
 const TRACKER_TAB = 'Tracker';
+
+/** Open the target spreadsheet by ID (works for standalone scripts). */
+function getSS_() {
+  if (!SPREADSHEET_ID) throw new Error('Missing SPREADSHEET_ID script property');
+  return SpreadsheetApp.openById(SPREADSHEET_ID);
+}
 
 function doPost(e) {
   const out = ContentService.createTextOutput();
@@ -40,7 +51,7 @@ function doPost(e) {
       out.setContent(JSON.stringify({ ok: false, error: 'unsupported action' }));
       return out;
     }
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const ss = getSS_();
     const groups = body.groups || {};
     let total = 0;
     Object.keys(groups).forEach(function (tab) {
@@ -77,7 +88,7 @@ function doGet(e) {
       out.setContent(JSON.stringify({ ok: false, error: 'bad secret' }));
       return out;
     }
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const ss = getSS_();
     const tabs = {};
     ss.getSheets().forEach(function (sh) {
       const name = sh.getName();
@@ -107,7 +118,7 @@ function writeTable_(sheet, headers, rows) {
         return headers.map(function (h, i) {
           let v = row[i] !== undefined && row[i] !== null ? row[i] : '';
           if (String(h).indexOf('(Date)') !== -1 &&
-              /^\\d{4}-\\d{2}-\\d{2}$/.test(String(v))) {
+              /^\d{4}-\d{2}-\d{2}$/.test(String(v))) {
             const p = String(v).split('-');
             v = Utilities.formatDate(
               new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2])),
@@ -136,7 +147,7 @@ function appendLog_(ss, when, rowCount, tabCount) {
 
 /** Run once from the editor (▶ Run) to pre-create tabs & grant permissions. */
 function setupSheets() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = getSS_();
   const headers = ['Lead Number', 'Full Name (Lead)', 'User name (Lead)',
     'Profile Link', 'Followers Count', 'Sender Name', 'Sender Profile',
     'First Touchpoint (Date)', 'Note', 'Status', 'Last Touchpoint (Date)',

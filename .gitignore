@@ -2,6 +2,8 @@
 .env
 .env.local
 .env.*.local
+.env.*
+!.env.example
 
 # --- Python Caches & Virtual Environments ---
 __pycache__/
@@ -27,3 +29,11 @@ venv.bak/
 .idea/
 .DS_Store
 *.swp
+
+# --- Credential files ---
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+service-account*.json

@@ -6,4 +6,5 @@ requests==2.34.2
 pillow==12.3.0
 python-dotenv==1.2.3
 psycopg[binary]==3.2.10
+groq>=0.31.0
 

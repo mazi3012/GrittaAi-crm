@@ -38,6 +38,7 @@ from datetime import date, timedelta
 import requests
 import telebot
 from dotenv import load_dotenv
+from groq import Groq
 from PIL import Image
 from telebot import types
 
@@ -49,6 +50,8 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = os.getenv("MODEL", "stealth/ox-alpha")
 VISION_MODEL = os.getenv("VISION_MODEL", MODEL)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.6-27b").strip()
 
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "").strip()
 # Telegram rejects localhost/private URLs on inline buttons ("Wrong HTTP URL"),
@@ -56,8 +59,11 @@ DASHBOARD_URL = os.getenv("DASHBOARD_URL", "").strip()
 if not DASHBOARD_URL.startswith(("https://", "http://")) or "localhost" in DASHBOARD_URL or "127.0.0.1" in DASHBOARD_URL:
     DASHBOARD_URL = None
 
-if not TELEGRAM_TOKEN or not OPENROUTER_API_KEY:
-    raise ValueError("Error: TELEGRAM_TOKEN or OPENROUTER_API_KEY missing from .env!")
+if not TELEGRAM_TOKEN or (not OPENROUTER_API_KEY and not GROQ_API_KEY):
+    raise ValueError(
+        "Error: TELEGRAM_TOKEN and at least one AI provider key "
+        "(OPENROUTER_API_KEY or GROQ_API_KEY) are required in .env!"
+    )
 
 from db import (  # noqa: E402  (after env validation)
     CLOSER_STATUSES,
@@ -365,6 +371,8 @@ try:
 except Exception:
     pass
 
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
 
 def prepare_image_b64(image_bytes, max_dim=MAX_IMAGE_DIM):
     """Resize screenshot if needed and return base64 string and mime type."""
@@ -415,8 +423,38 @@ def _ask_gemini_direct(prompt_text, image_bytes=None, timeout=90):
     return None
 
 
+def _ask_groq(messages, timeout=90):
+    """Call Groq with streaming enabled and return the assembled response."""
+    if not groq_client:
+        return None
+
+    try:
+        completion = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            temperature=0.6,
+            max_completion_tokens=2048,
+            top_p=0.95,
+            reasoning_effort="default",
+            stream=True,
+            stop=None,
+            timeout=timeout,
+        )
+        chunks = []
+        for chunk in completion:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            content = getattr(delta, "content", None) if delta else None
+            if content:
+                chunks.append(content)
+        reply = "".join(chunks).strip()
+        return reply or None
+    except Exception as exc:
+        print(f"Groq API request error: {exc}")
+        return None
+
+
 def ask_ai(prompt_text, image_bytes=None, timeout=90):
-    """Send a text or multimodal vision prompt to OpenRouter / Gemini API and return reply text."""
+    """Send a text or multimodal prompt, falling back to Groq when needed."""
     if GEMINI_API_KEY:
         res = _ask_gemini_direct(prompt_text, image_bytes=image_bytes, timeout=timeout)
         if res:
@@ -466,6 +504,12 @@ def ask_ai(prompt_text, image_bytes=None, timeout=90):
             print(f"OpenRouter request error: {exc}")
         if attempt == 1:
             time.sleep(3)
+
+    if groq_client:
+        return _ask_groq([
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ], timeout=timeout)
     return None
 
 
@@ -1629,6 +1673,9 @@ def ask_ai_chat(user_text, chat_id):
             print(f"OpenRouter request error: {exc}")
         if attempt == 1:
             time.sleep(3)
+
+    if groq_client:
+        return _ask_groq(messages, timeout=90)
     return None
 
 

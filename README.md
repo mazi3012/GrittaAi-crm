@@ -53,7 +53,7 @@ The bot can clone your entire `leads` table into a public Google Sheet so teamma
 ### One-time setup (~3 minutes)
 
 1. Open your team Google Sheet → **Extensions → Apps Script**.
-2. Paste the contents of [`google-apps-script.gs`](google-apps-script.gs), and set the `SECRET` constant to any long random string.
+2. Paste the contents of [`google-apps-script.gs`](google-apps-script.gs). In **Project Settings → Script Properties**, add `GOOGLE_SHEET_SECRET` (a long random string) and `SPREADSHEET_ID` (your spreadsheet ID). Do not put either value in the script source.
 3. **Deploy → New deployment → Web app** with *Execute as: Me* and *Who has access: Anyone* (the shared secret is what actually blocks strangers). Authorize when prompted.
 4. Copy the Web app URL ending in `/exec`.
 5. Add to your environment (local `.env`, Render/HF Spaces secrets):
@@ -131,7 +131,9 @@ The bot can clone your entire `leads` table into a public Google Sheet so teamma
 | Variable | Description | Default |
 |---|---|---|
 | `TELEGRAM_TOKEN` | Bot token from @BotFather (**Required**) | — |
-| `OPENROUTER_API_KEY` | OpenRouter API Key (**Required**) | — |
+| `OPENROUTER_API_KEY` | OpenRouter API Key (primary provider; optional when Groq is configured) | — |
+| `GROQ_API_KEY` | Groq API Key used as fallback for text and vision requests | — |
+| `GROQ_MODEL` | Groq fallback model | `qwen/qwen3.6-27b` |
 | `MODEL` | OpenRouter Model ID | `stealth/ox-alpha` |
 | `VISION_MODEL` | OpenRouter Vision Model ID | `stealth/ox-alpha` |
 | `DASHBOARD_URL` | Public HTTPS URL of the Vercel dashboard | — |
