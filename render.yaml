@@ -39,7 +39,7 @@ services:
         value: stealth/ox-alpha
       - key: GROQ_MODEL
         value: qwen/qwen3.6-27b
-      # Screenshot analysis uses the same ox-alpha model (vision-capable).
+      # Screenshot analysis uses Groq Qwen first, then OpenRouter as fallback.
       - key: VISION_MODEL
         value: stealth/ox-alpha
       # Render injects PORT automatically; bot.py reads it (default 7860).

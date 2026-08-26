@@ -132,8 +132,8 @@ The bot can clone your entire `leads` table into a public Google Sheet so teamma
 |---|---|---|
 | `TELEGRAM_TOKEN` | Bot token from @BotFather (**Required**) | — |
 | `OPENROUTER_API_KEY` | OpenRouter API Key (primary provider; optional when Groq is configured) | — |
-| `GROQ_API_KEY` | Groq API Key used as fallback for text and vision requests | — |
-| `GROQ_MODEL` | Groq fallback model | `qwen/qwen3.6-27b` |
+| `GROQ_API_KEY` | Groq API Key; primary for vision and fallback for text | — |
+| `GROQ_MODEL` | Groq vision/fallback model | `qwen/qwen3.6-27b` |
 | `MODEL` | OpenRouter Model ID | `stealth/ox-alpha` |
 | `VISION_MODEL` | OpenRouter Vision Model ID | `stealth/ox-alpha` |
 | `DASHBOARD_URL` | Public HTTPS URL of the Vercel dashboard | — |

@@ -454,8 +454,8 @@ def _ask_groq(messages, timeout=90):
 
 
 def ask_ai(prompt_text, image_bytes=None, timeout=90):
-    """Send a text or multimodal prompt, falling back to Groq when needed."""
-    if GEMINI_API_KEY:
+    """Send a prompt using Groq-first vision and OpenRouter-first text routing."""
+    if GEMINI_API_KEY and not image_bytes:
         res = _ask_gemini_direct(prompt_text, image_bytes=image_bytes, timeout=timeout)
         if res:
             return res
@@ -479,12 +479,21 @@ def ask_ai(prompt_text, image_bytes=None, timeout=90):
     else:
         user_content = prompt_text
 
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+
+    # Qwen on Groq is the primary provider for screenshots. If it fails,
+    # continue to the OpenRouter vision model below.
+    if image_bytes and groq_client:
+        res = _ask_groq(messages, timeout=timeout)
+        if res:
+            return res
+
     payload = {
         "model": model_to_use,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
+        "messages": messages,
     }
 
     for attempt in (1, 2):
@@ -505,7 +514,7 @@ def ask_ai(prompt_text, image_bytes=None, timeout=90):
         if attempt == 1:
             time.sleep(3)
 
-    if groq_client:
+    if not image_bytes and groq_client:
         return _ask_groq([
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
