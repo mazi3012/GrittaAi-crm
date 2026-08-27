@@ -394,6 +394,18 @@ body {
   transform: translateY(-1px);
 }
 
+.icon-btn.is-loading {
+  cursor: wait;
+  opacity: .78;
+}
+
+.icon-btn.is-loading::first-letter {
+  display: inline-block;
+  animation: spin .8s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
 .theme-toggle-btn {
   background: var(--bg-3);
   border-color: rgba(16, 185, 129, 0.3);
@@ -415,6 +427,30 @@ body {
   padding-right: 2px;
 }
 .view.active { display: block; }
+
+/* First-load placeholder: keep the layout stable while the API responds. */
+.skeleton-page { display: flex; flex-direction: column; gap: 14px; }
+.skeleton-kpis, .skeleton-columns { display: grid; gap: 13px; }
+.skeleton-kpis { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.skeleton-columns { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.skeleton-card, .skeleton-panel { padding: 18px; overflow: hidden; }
+.skeleton-card { min-height: 104px; display: flex; flex-direction: column; justify-content: space-between; }
+.skeleton-panel { min-height: 250px; display: flex; flex-direction: column; gap: 14px; }
+.leaderboard-skeleton { min-height: 150px; }
+.skeleton-line, .skeleton-chart {
+  display: block;
+  border-radius: 8px;
+  background: linear-gradient(90deg, var(--bg-2) 25%, var(--bg-3) 50%, var(--bg-2) 75%);
+  background-size: 220% 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+}
+.skeleton-line { height: 12px; width: 72%; }
+.skeleton-line.short { width: 42%; height: 10px; }
+.skeleton-line.number { width: 34%; height: 28px; }
+.skeleton-line.title { width: 35%; height: 16px; }
+.skeleton-line.wide { width: 92%; }.skeleton-line.medium { width: 64%; }
+.skeleton-chart { flex: 1; min-height: 150px; border-radius: 50%; opacity: .75; }
+@keyframes shimmer { 0% { background-position: 100% 0; } 100% { background-position: -100% 0; } }
 
 /* ══════════ ASSISTANT CHAT ══════════ */
 .assistant-shell { height: 100%; min-height: 520px; display: flex; flex-direction: column; gap: 10px; max-width: 980px; margin: 0 auto; }
@@ -1240,6 +1276,11 @@ html[data-theme="dark"] .chip.score-LOW     { color: #f87171; }
   }
   .hamburger-btn { display: inline-flex !important; }
   .top-search { width: 180px; }
+}
+
+@media (max-width: 700px) {
+  .skeleton-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .skeleton-columns { grid-template-columns: 1fr; }
 }
 
 /* ══════════════════════════════════════════════════════════════

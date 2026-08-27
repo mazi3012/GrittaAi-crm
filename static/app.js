@@ -33,6 +33,10 @@ let FILTER = { status: "", setter: "", q: "" };
 let SORT = { key: "updated", dir: -1 };
 let VIEW = "overview";
 let TEAM_TAB = "";  // Team view: "" = leaderboard tab, otherwise a setter name
+let DATA_READY = false;
+let DATA_SIGNATURE = "";
+let LOADING = false;
+let POLL_HANDLE = null;
 let ASSISTANT_MESSAGES = (() => {
   try { return JSON.parse(localStorage.getItem("gretta-assistant-chat") || "[]"); }
   catch { return []; }
@@ -144,6 +148,20 @@ function collectSetters() {
    ============================================================ */
 function renderOverview() {
   const el = $("view-overview");
+  if (!DATA_READY) {
+    el.innerHTML = `
+      <div class="skeleton-page" aria-label="Loading dashboard" aria-busy="true">
+        <div class="skeleton-kpis">
+          ${Array.from({ length: 5 }, () => `<div class="glass skeleton-card"><span class="skeleton-line short"></span><span class="skeleton-line number"></span></div>`).join("")}
+        </div>
+        <div class="skeleton-columns">
+          <div class="glass skeleton-panel"><span class="skeleton-line title"></span><span class="skeleton-line wide"></span><span class="skeleton-line wide"></span><span class="skeleton-line medium"></span><span class="skeleton-line wide"></span></div>
+          <div class="glass skeleton-panel"><span class="skeleton-line title"></span><span class="skeleton-chart"></span></div>
+        </div>
+        <div class="glass skeleton-panel leaderboard-skeleton"><span class="skeleton-line title"></span><span class="skeleton-line wide"></span><span class="skeleton-line wide"></span><span class="skeleton-line medium"></span></div>
+      </div>`;
+    return;
+  }
   if (!LEADS.length) {
     el.innerHTML = `
     <div class="glass empty-wrap fade-in">
@@ -861,22 +879,41 @@ function wireLogin() {
 
 /* ---------- data loading / polling ---------- */
 async function load({ silent = false } = {}) {
+  if (LOADING) return;
+  LOADING = true;
+  const refreshBtn = $("refreshBtn");
+  if (refreshBtn) refreshBtn.classList.add("is-loading");
   try {
     const data = await api("/api/leads");
-    LEADS = data.leads || [];
-    STATS = data.stats || {};
+    const nextLeads = data.leads || [];
+    const nextStats = data.stats || {};
+    const nextSignature = JSON.stringify([nextLeads, nextStats]);
+    const changed = nextSignature !== DATA_SIGNATURE;
+    LEADS = nextLeads;
+    STATS = nextStats;
+    DATA_SIGNATURE = nextSignature;
+    DATA_READY = true;
     LAST_ERR_TOAST = 0;
-    render();
+    // A silent poll should be invisible when nothing changed. Rebuilding the
+    // whole view here was the source of the visible blink every five seconds.
+    if (changed || !silent) render();
   } catch (err) {
     if (!silent && Date.now() - LAST_ERR_TOAST > 30000) {
       toast(`Load failed: ${err.message}`, "err");
       LAST_ERR_TOAST = Date.now();
     }
+  } finally {
+    LOADING = false;
+    if (refreshBtn) refreshBtn.classList.remove("is-loading");
   }
 }
 function startPolling() {
-  clearInterval(TIMER);
-  TIMER = setInterval(() => { if (!PAUSED && !DRAWER_USER) load({ silent: true }); }, 5000);
+  clearTimeout(POLL_HANDLE);
+  const poll = async () => {
+    if (!PAUSED && !DRAWER_USER) await load({ silent: true });
+    POLL_HANDLE = setTimeout(poll, 5000);
+  };
+  POLL_HANDLE = setTimeout(poll, 5000);
 }
 
 /* ---------- theme / pause / render root ---------- */
@@ -891,7 +928,8 @@ function toggleTheme() {
 }
 function togglePause() {
   PAUSED = !PAUSED;
-  $("pauseBtn").textContent = PAUSED ? "▶️" : "⏸";
+  $("pauseBtn").textContent = PAUSED ? "▶ Resume updates" : "⏸ Pause updates";
+  $("pauseBtn").title = PAUSED ? "Resume live polling" : "Pause live polling";
   updateBotStatus();
   toast(PAUSED ? "Auto-refresh paused" : "Auto-refresh resumed");
 }
