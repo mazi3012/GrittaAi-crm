@@ -67,6 +67,20 @@ The bot can clone your entire `leads` table into a public Google Sheet so teamma
 
 > 💡 The sheet is a **mirror**: the CRM database stays the source of truth, and each sync overwrites manual sheet edits. If a dashboard-side change happens while Vercel's serverless worker is frozen, the next bot-side change (or `/syncsheet`) catches it up. Leave `GOOGLE_SHEET_WEBAPP_URL` empty to disable the feature entirely — everything then behaves exactly as before.
 
+### Import an Excel workbook
+
+To import an exported CRM workbook directly into the configured database, run:
+
+```bash
+python import_workbook.py "/absolute/path/to/CRM - Instagram Data(1).xlsx"
+```
+
+Use `--dry-run` first to review the tabs and row totals without writing. Setter
+tabs are imported column-for-column; `Tracker` and `Closer` are skipped because
+they are derived/reporting tabs. Existing leads are updated by Instagram
+username, while new leads are inserted. The importer preserves `Guthal
+Basumatary` as the canonical setter name.
+
 ---
 
 ## ☁️ Deployment Guide

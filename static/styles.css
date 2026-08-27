@@ -416,6 +416,30 @@ body {
 }
 .view.active { display: block; }
 
+/* ══════════ ASSISTANT CHAT ══════════ */
+.assistant-shell { height: 100%; min-height: 520px; display: flex; flex-direction: column; gap: 10px; max-width: 980px; margin: 0 auto; }
+.assistant-header { flex: none; padding: 14px 18px; display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.assistant-heading { display: flex; align-items: center; gap: 11px; }
+.assistant-heading h1 { margin: 0; font-size: 18px; letter-spacing: -.02em; }
+.assistant-heading p { margin: 2px 0 0; color: var(--txt-3); font-size: 11px; }
+.assistant-avatar { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 50%; color: white; background: linear-gradient(135deg, #10b981, #0ea5e9); font-weight: 800; font-size: 14px; box-shadow: 0 5px 15px -5px var(--glow); }
+.assistant-avatar.large { width: 42px; height: 42px; font-size: 20px; }
+.assistant-online-dot { display: inline-block; width: 6px; height: 6px; margin-right: 3px; border-radius: 50%; background: #34d399; box-shadow: 0 0 0 3px rgba(52,211,153,.14); }
+.assistant-chat { flex: 1; min-height: 300px; overflow-y: auto; padding: 24px clamp(12px, 4vw, 56px); }
+.assistant-message { display: flex; align-items: flex-end; gap: 8px; margin: 0 0 14px; animation: fadeIn .2s ease both; }
+.assistant-message.from-user { justify-content: flex-end; }
+.assistant-bubble { max-width: min(78%, 620px); padding: 11px 14px; border-radius: 17px 17px 17px 5px; background: var(--bg-2); border: 1px solid var(--line); color: var(--txt-1); line-height: 1.55; white-space: normal; }
+.from-user .assistant-bubble { border-radius: 17px 17px 5px 17px; color: #fff; background: linear-gradient(135deg, #059669, #0e7490); border-color: transparent; box-shadow: 0 7px 18px -12px var(--glow); }
+.assistant-typing { display: flex; gap: 4px; padding: 14px 16px; }
+.assistant-typing i { width: 5px; height: 5px; border-radius: 50%; background: var(--txt-3); animation: assistantBounce 1s infinite ease-in-out; }
+.assistant-typing i:nth-child(2) { animation-delay: .15s; }.assistant-typing i:nth-child(3) { animation-delay: .3s; }
+@keyframes assistantBounce { 0%, 60%, 100% { transform: translateY(0); } 30% { transform: translateY(-4px); } }
+.assistant-welcome { max-width: 520px; margin: 8vh auto 0; text-align: center; }
+.assistant-welcome-icon { display: inline-flex; align-items: center; justify-content: center; width: 58px; height: 58px; border-radius: 19px; color: #fff; font-size: 29px; background: linear-gradient(135deg, #10b981, #0ea5e9); box-shadow: 0 14px 30px -12px var(--glow); }
+.assistant-welcome h2 { margin: 14px 0 5px; font-size: 22px; }.assistant-welcome p { margin: 0 auto 20px; color: var(--txt-3); font-size: 13px; }
+.assistant-suggestions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }.assistant-suggestions button { padding: 9px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--bg-2); color: var(--txt-2); font: 600 12px inherit; cursor: pointer; }.assistant-suggestions button:hover { border-color: var(--brand); color: var(--txt-1); }
+.assistant-composer { display: flex; align-items: flex-end; gap: 8px; padding: 8px 9px 8px 15px; }.assistant-composer textarea { flex: 1; resize: none; max-height: 120px; border: 0; outline: 0; padding: 9px 0; background: transparent; color: var(--txt-1); font: 13.5px/1.45 inherit; }.assistant-composer textarea::placeholder { color: var(--txt-3); }.assistant-send { width: 37px; height: 37px; flex: none; border: 0; border-radius: 12px; background: linear-gradient(135deg, #10b981, #0891b2); color: white; font-size: 18px; cursor: pointer; }.assistant-send:disabled { opacity: .5; cursor: wait; }.assistant-disclaimer { flex: none; text-align: center; color: var(--txt-3); font-size: 10.5px; padding-bottom: 2px; }
+
 /* ══════════ KPI CARDS ══════════ */
 .kpi {
   position: relative;

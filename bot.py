@@ -225,6 +225,22 @@ def esc(text):
     return html.escape(str(text), quote=False)
 
 
+def clean_ai_reply(text):
+    """Strip provider reasoning traces before they reach Telegram."""
+    value = str(text or "")
+    # A few providers omit the opening tag, so when a closing tag exists the
+    # safe boundary is everything after that tag.
+    if re.search(r"</think>", value, flags=re.IGNORECASE):
+        value = re.split(r"</think>\s*", value, maxsplit=1,
+                         flags=re.IGNORECASE)[1]
+    else:
+        value = re.sub(r"<think>.*$", "", value,
+                       flags=re.IGNORECASE | re.DOTALL)
+    value = re.sub(r"\[(?:done|proceeds?)\]\s*", "", value,
+                   flags=re.IGNORECASE)
+    return value.strip()
+
+
 def main_menu_kb():
     """Main app menu shown by /start and the 🏠 Home button."""
     kb = types.InlineKeyboardMarkup(row_width=2)
@@ -435,7 +451,6 @@ def _ask_groq(messages, timeout=90):
             temperature=0.6,
             max_completion_tokens=2048,
             top_p=0.95,
-            reasoning_effort="default",
             stream=True,
             stop=None,
             timeout=timeout,
@@ -446,7 +461,7 @@ def _ask_groq(messages, timeout=90):
             content = getattr(delta, "content", None) if delta else None
             if content:
                 chunks.append(content)
-        reply = "".join(chunks).strip()
+        reply = clean_ai_reply("".join(chunks))
         return reply or None
     except Exception as exc:
         print(f"Groq API request error: {exc}")
@@ -494,6 +509,7 @@ def ask_ai(prompt_text, image_bytes=None, timeout=90):
     payload = {
         "model": model_to_use,
         "messages": messages,
+        "reasoning": {"exclude": True},
     }
 
     for attempt in (1, 2):
@@ -506,7 +522,7 @@ def ask_ai(prompt_text, image_bytes=None, timeout=90):
                 else:
                     choices = data.get("choices")
                     if choices:
-                        return choices[0]["message"]["content"]
+                        return clean_ai_reply(choices[0]["message"].get("content"))
             else:
                 print(f"OpenRouter API error ({resp.status_code}): {resp.text[:200]}")
         except (requests.RequestException, ValueError) as exc:
@@ -884,8 +900,9 @@ def stats_text():
     for status in STATUSES:
         n = s["by_status"].get(status, 0)
         if n:
-            bar = "█" * min(n, 20)
-            lines.append(f"{STATUS_EMOJI.get(status, '▫️')} <b>{status}</b>: {n} {bar}")
+            # Block-drawing bars render as opaque white rectangles in some
+            # Telegram Android fonts/themes. Keep the stats text portable.
+            lines.append(f"{STATUS_EMOJI.get(status, '▫️')} <b>{status}</b>: {n}")
     lines.append("")
     for name, bucket in s["setters"].items():
         lines.append(f"🧑‍💼 <b>{esc(name)}</b>: {bucket['total']} leads")
@@ -1217,7 +1234,7 @@ def analyze_and_reply(status, image_bytes, user_caption, target_user,
         f"{ANALYSIS_INSTRUCTIONS}"
     )
 
-    ai_reply = ask_ai(prompt, image_bytes=image_bytes)
+    ai_reply = clean_ai_reply(ask_ai(prompt, image_bytes=image_bytes))
     if not ai_reply:
         edit_status(status, "⚠️ AI analysis failed — the vision model may be busy. "
                             "Please try again.")
@@ -1664,7 +1681,11 @@ def ask_ai_chat(user_text, chat_id):
     messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}]
     messages.extend(history_for(chat_id))
     messages.append({"role": "user", "content": user_text})
-    payload = {"model": MODEL, "messages": messages}
+    payload = {
+        "model": MODEL,
+        "messages": messages,
+        "reasoning": {"exclude": True},
+    }
     for attempt in (1, 2):
         try:
             resp = session.post(OPENROUTER_URL, json=payload, timeout=90)
@@ -1675,7 +1696,7 @@ def ask_ai_chat(user_text, chat_id):
                 else:
                     choices = data.get("choices")
                     if choices:
-                        return choices[0]["message"]["content"]
+                        return clean_ai_reply(choices[0]["message"].get("content"))
             else:
                 print(f"OpenRouter API error ({resp.status_code}): {resp.text[:200]}")
         except (requests.RequestException, ValueError) as exc:
@@ -1806,6 +1827,7 @@ def handle_free_text(message):
             "🤔 I couldn't reach my AI brain just now (the model provider may "
             "be busy). Try again in a moment!"
         )
+    reply = clean_ai_reply(reply)
     remember(message.chat.id, "assistant", reply)
     send_long(message.chat.id, esc(reply))
 

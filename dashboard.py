@@ -32,8 +32,11 @@ Run with either:
 """
 
 import hmac
+import json
 import os
 import time
+import urllib.error
+import urllib.request
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
@@ -59,6 +62,26 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 MAX_TEXT = 4000  # sanity cap for note payloads
+MAX_CHAT_MESSAGES = 24
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+ASSISTANT_MODEL = os.getenv("ASSISTANT_MODEL", os.getenv("MODEL", "stealth/ox-alpha")).strip()
+
+
+def clean_assistant_reply(text):
+    """Remove reasoning traces some providers include in normal content."""
+    import re
+
+    value = str(text or "")
+    if re.search(r"</think>", value, flags=re.IGNORECASE):
+        value = re.split(r"</think>\s*", value, maxsplit=1,
+                         flags=re.IGNORECASE)[1]
+    else:
+        value = re.sub(r"<think>.*$", "", value,
+                       flags=re.IGNORECASE | re.DOTALL)
+    value = re.sub(r"\[(?:done|proceeds?)\]\s*", "", value,
+                   flags=re.IGNORECASE)
+    return value.strip()
 
 app = FastAPI(title="Gretta CRM")
 
@@ -122,6 +145,15 @@ class LoginIn(BaseModel):
     password: str = Field(min_length=1, max_length=200)
 
 
+class AssistantMessage(BaseModel):
+    role: str = Field(pattern="^(user|assistant)$")
+    content: str = Field(min_length=1, max_length=MAX_TEXT)
+
+
+class AssistantChatIn(BaseModel):
+    messages: list[AssistantMessage] = Field(min_length=1, max_length=MAX_CHAT_MESSAGES)
+
+
 @app.get("/api/auth/status")
 def api_auth_status(request: Request):
     """SPA boot check: is a password configured, and do we hold a session?"""
@@ -154,6 +186,65 @@ def api_auth_login(payload: LoginIn, response: Response):
 def api_auth_logout(response: Response):
     response.delete_cookie(COOKIE_NAME)
     return {"ok": True}
+
+
+@app.post("/api/assistant/chat")
+def api_assistant_chat(payload: AssistantChatIn):
+    """Proxy a dashboard assistant conversation without exposing the provider key."""
+    if not OPENROUTER_API_KEY:
+        return JSONResponse(status_code=503, content={
+            "ok": False, "error": "Assistant is not configured. Add OPENROUTER_API_KEY."
+        })
+
+    knowledge_path = os.path.join(BASE_DIR, "knowledge.txt")
+    try:
+        with open(knowledge_path, "r", encoding="utf-8") as knowledge_file:
+            knowledge = knowledge_file.read().strip()
+    except OSError:
+        knowledge = "You are Gretta, a practical CRM and sales assistant."
+    system = (
+        "You are Gretta Assistant inside a private CRM dashboard. Be warm, concise, "
+        "and practical. Help with sales follow-ups, lead qualification, outreach "
+        "copy, and CRM workflows. Never claim to have changed CRM data. If the user "
+        "needs a data change, explain that they should use the CRM controls.\n\n"
+        f"TEAM KNOWLEDGE BASE:\n{knowledge}"
+    )
+    messages = [{"role": "system", "content": system}]
+    messages.extend({"role": message.role, "content": message.content}
+                    for message in payload.messages[-MAX_CHAT_MESSAGES:])
+    request_body = json.dumps({
+        "model": ASSISTANT_MODEL,
+        "messages": messages,
+        "reasoning": {"exclude": True},
+        "temperature": 0.6,
+        "max_tokens": 1200,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        OPENROUTER_URL,
+        data=request_body,
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": os.getenv("DASHBOARD_URL", "http://localhost"),
+            "X-Title": "Gretta Assistant",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        answer = clean_assistant_reply(
+            ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
+        )
+        if not answer:
+            raise ValueError("Provider returned an empty response")
+        return {"ok": True, "message": answer.strip(), "model": ASSISTANT_MODEL}
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as exc:
+        detail = getattr(exc, "reason", None) or str(exc)
+        print(f"Assistant API error: {detail}")
+        return JSONResponse(status_code=502, content={
+            "ok": False, "error": "Gretta could not answer right now. Please try again."
+        })
 
 
 def _lead_dicts():
