@@ -118,8 +118,10 @@ Basumatary` as the canonical setter name.
 1. Import your repository (`mazi3012/GrittaAi-crm.git`) into [Vercel](https://vercel.com/new).
 2. Vercel automatically detects the root-level `index.py` FastAPI entrypoint.
 3. In Project Settings -> **Environment Variables**, set `DATABASE_URL` to the same Neon Postgres connection string used by the Telegram bot.
-4. For a temporary SQLite-only deployment, set `DB_PATH` to `/tmp/crm.db`; Vercel storage is otherwise ephemeral and should not be used as the shared CRM database.
-5. Deploy! Your CRM dashboard will be live at `https://your-project.vercel.app`.
+4. To enable the dashboard Assistant, add `OPENROUTER_API_KEY` with your OpenRouter key. Optionally add `ASSISTANT_MODEL` to override the default assistant model (otherwise `MODEL` is used).
+5. If admin authentication is enabled, also add `ADMIN_PASSWORD` and, optionally, `ADMIN_USERNAME` and `ADMIN_SESSION_SECRET`.
+6. For a temporary SQLite-only deployment, set `DB_PATH` to `/tmp/crm.db`; Vercel storage is otherwise ephemeral and should not be used as the shared CRM database.
+7. Redeploy after adding or changing environment variables. Your CRM dashboard will be live at `https://your-project.vercel.app`.
 
 ---
 

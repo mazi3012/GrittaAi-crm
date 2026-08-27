@@ -42,6 +42,9 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from db import (  # noqa: E402
     CLOSING_CALL_STATUSES,
@@ -66,6 +69,9 @@ MAX_CHAT_MESSAGES = 24
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 ASSISTANT_MODEL = os.getenv("ASSISTANT_MODEL", os.getenv("MODEL", "stealth/ox-alpha")).strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.6-27b").strip()
 
 
 def clean_assistant_reply(text):
@@ -82,6 +88,52 @@ def clean_assistant_reply(text):
     value = re.sub(r"\[(?:done|proceeds?)\]\s*", "", value,
                    flags=re.IGNORECASE)
     return value.strip()
+
+
+def _assistant_provider_request(url, api_key, model, messages, provider):
+    """Call an OpenAI-compatible assistant provider and return its reply."""
+    request_payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.6,
+        "max_tokens": 1200,
+    }
+    if provider == "OpenRouter":
+        request_payload["reasoning"] = {"exclude": True}
+    request_body = json.dumps(request_payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=request_body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": os.getenv("DASHBOARD_URL", "http://localhost"),
+            "X-Title": "Gretta Assistant",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        if isinstance(data.get("error"), dict):
+            error = data["error"]
+            raise RuntimeError(
+                f"{provider} returned an upstream error: "
+                f"{error.get('code') or error.get('message') or 'unknown error'}"
+            )
+        answer = clean_assistant_reply(
+            ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
+        )
+        if not answer:
+            raise ValueError(f"{provider} returned an empty response")
+        return answer
+    except urllib.error.HTTPError as exc:
+        # Read a short provider response for logs without returning it to users.
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            detail = str(exc)
+        raise RuntimeError(f"{provider} HTTP {exc.code}: {detail}") from exc
 
 app = FastAPI(title="Gretta CRM")
 
@@ -147,7 +199,9 @@ class LoginIn(BaseModel):
 
 class AssistantMessage(BaseModel):
     role: str = Field(pattern="^(user|assistant)$")
-    content: str = Field(min_length=1, max_length=MAX_TEXT)
+    # Text messages use a string; screenshot messages use the OpenAI-compatible
+    # [{type: "text"}, {type: "image_url"}] content shape.
+    content: str | list[dict]
 
 
 class AssistantChatIn(BaseModel):
@@ -191,9 +245,10 @@ def api_auth_logout(response: Response):
 @app.post("/api/assistant/chat")
 def api_assistant_chat(payload: AssistantChatIn):
     """Proxy a dashboard assistant conversation without exposing the provider key."""
-    if not OPENROUTER_API_KEY:
+    if not OPENROUTER_API_KEY and not GROQ_API_KEY:
         return JSONResponse(status_code=503, content={
-            "ok": False, "error": "Assistant is not configured. Add OPENROUTER_API_KEY."
+            "ok": False,
+            "error": "Assistant is not configured. Add OPENROUTER_API_KEY or GROQ_API_KEY."
         })
 
     knowledge_path = os.path.join(BASE_DIR, "knowledge.txt")
@@ -210,41 +265,33 @@ def api_assistant_chat(payload: AssistantChatIn):
         f"TEAM KNOWLEDGE BASE:\n{knowledge}"
     )
     messages = [{"role": "system", "content": system}]
-    messages.extend({"role": message.role, "content": message.content}
-                    for message in payload.messages[-MAX_CHAT_MESSAGES:])
-    request_body = json.dumps({
-        "model": ASSISTANT_MODEL,
-        "messages": messages,
-        "reasoning": {"exclude": True},
-        "temperature": 0.6,
-        "max_tokens": 1200,
-    }).encode("utf-8")
-    request = urllib.request.Request(
-        OPENROUTER_URL,
-        data=request_body,
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": os.getenv("DASHBOARD_URL", "http://localhost"),
-            "X-Title": "Gretta Assistant",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=45) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        answer = clean_assistant_reply(
-            ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
-        )
-        if not answer:
-            raise ValueError("Provider returned an empty response")
-        return {"ok": True, "message": answer.strip(), "model": ASSISTANT_MODEL}
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError) as exc:
-        detail = getattr(exc, "reason", None) or str(exc)
-        print(f"Assistant API error: {detail}")
-        return JSONResponse(status_code=502, content={
-            "ok": False, "error": "Gretta could not answer right now. Please try again."
-        })
+    for message in payload.messages[-MAX_CHAT_MESSAGES:]:
+        content = message.content
+        if isinstance(content, str):
+            content = content[:MAX_TEXT]
+        messages.append({"role": message.role, "content": content})
+    providers = []
+    # Groq is the preferred provider for both text and screenshots. OpenRouter
+    # remains available as a transparent fallback if Groq is unavailable.
+    if GROQ_API_KEY:
+        providers.append((GROQ_URL, GROQ_API_KEY, GROQ_MODEL, "Groq"))
+    if OPENROUTER_API_KEY:
+        providers.append((OPENROUTER_URL, OPENROUTER_API_KEY, ASSISTANT_MODEL, "OpenRouter"))
+
+    errors = []
+    for url, api_key, model, provider in providers:
+        try:
+            answer = _assistant_provider_request(
+                url, api_key, model, messages, provider
+            )
+            return {"ok": True, "message": answer, "model": model, "provider": provider}
+        except (urllib.error.URLError, TimeoutError, ValueError, RuntimeError) as exc:
+            errors.append(f"{provider}: {exc}")
+            print(f"Assistant {provider} error: {exc}")
+
+    return JSONResponse(status_code=502, content={
+        "ok": False, "error": "Gretta could not answer right now. Please try again."
+    })
 
 
 def _lead_dicts():

@@ -42,6 +42,7 @@ let ASSISTANT_MESSAGES = (() => {
   catch { return []; }
 })();
 let ASSISTANT_BUSY = false;
+let ASSISTANT_IMAGE = null;
 let TIMER = null, PAUSED = false, LAST_ERR_TOAST = 0;
 
 const $ = (id) => document.getElementById(id);
@@ -792,10 +793,22 @@ function renderAccess() {
 /* ---------- Assistant view ---------- */
 function assistantBubble(message) {
   const isUser = message.role === "user";
+  const content = Array.isArray(message.content)
+    ? message.content.find(part => part.type === "text")?.text || ""
+    : message.content;
+  const hasImage = Array.isArray(message.content) && message.content.some(part => part.type === "image_url");
   return `<div class="assistant-message ${isUser ? "from-user" : "from-gretta"}">
     ${!isUser ? `<span class="assistant-avatar">✦</span>` : ""}
-    <div class="assistant-bubble">${esc(message.content).replace(/\n/g, "<br>")}</div>
+    <div class="assistant-bubble">${hasImage ? `<div class="assistant-image-label">📷 Screenshot attached</div>` : ""}${esc(content).replace(/\n/g, "<br>")}</div>
   </div>`;
+}
+
+function assistantImagePreview() {
+  return ASSISTANT_IMAGE ? `<div class="assistant-attachment">
+    <img src="${ASSISTANT_IMAGE.dataUrl}" alt="Screenshot preview">
+    <div><strong>${esc(ASSISTANT_IMAGE.name)}</strong><small>Ready for vision analysis</small></div>
+    <button type="button" id="removeAssistantImage" title="Remove screenshot">×</button>
+  </div>` : "";
 }
 
 function renderAssistant() {
@@ -819,7 +832,10 @@ function renderAssistant() {
     </div>
     <div class="assistant-chat glass" id="assistantChat">${messages}${ASSISTANT_BUSY ? `<div class="assistant-message from-gretta"><span class="assistant-avatar">✦</span><div class="assistant-bubble assistant-typing"><i></i><i></i><i></i></div></div>` : ""}</div>
     <form class="assistant-composer glass" id="assistantForm">
+      ${assistantImagePreview()}
       <textarea id="assistantInput" rows="1" maxlength="4000" placeholder="Message Gretta…" ${ASSISTANT_BUSY ? "disabled" : ""}></textarea>
+      <input id="assistantImageInput" type="file" accept="image/png,image/jpeg,image/webp" hidden ${ASSISTANT_BUSY ? "disabled" : ""}>
+      <button class="assistant-attach" type="button" id="assistantAttachBtn" title="Upload a screenshot" ${ASSISTANT_BUSY ? "disabled" : ""}>📎</button>
       <button class="assistant-send" type="submit" title="Send message" ${ASSISTANT_BUSY ? "disabled" : ""}>➤</button>
     </form>
     <div class="assistant-disclaimer">Gretta can make mistakes. Verify important decisions before acting.</div>
@@ -832,8 +848,13 @@ function renderAssistant() {
 
 async function sendAssistant(text) {
   const content = (text || "").trim();
-  if (!content || ASSISTANT_BUSY) return;
-  ASSISTANT_MESSAGES.push({ role: "user", content });
+  if ((!content && !ASSISTANT_IMAGE) || ASSISTANT_BUSY) return;
+  const userContent = ASSISTANT_IMAGE ? [
+    { type: "text", text: content || "Analyze this screenshot and tell me what I should do next." },
+    { type: "image_url", image_url: { url: ASSISTANT_IMAGE.dataUrl } },
+  ] : content;
+  ASSISTANT_MESSAGES.push({ role: "user", content: userContent });
+  ASSISTANT_IMAGE = null;
   localStorage.setItem("gretta-assistant-chat", JSON.stringify(ASSISTANT_MESSAGES));
   ASSISTANT_BUSY = true;
   renderAssistant();
@@ -1097,6 +1118,19 @@ function wireEvents() {
       localStorage.removeItem("gretta-assistant-chat");
       renderAssistant();
     }
+    if (e.target.closest("#assistantAttachBtn")) $("assistantImageInput")?.click();
+    if (e.target.closest("#removeAssistantImage")) { ASSISTANT_IMAGE = null; renderAssistant(); }
+  });
+  document.addEventListener("change", (e) => {
+    if (e.target.id !== "assistantImageInput" || !e.target.files?.[0]) return;
+    const file = e.target.files[0];
+    if (!file.type.startsWith("image/")) return toast("Please choose an image file", "err");
+    const reader = new FileReader();
+    reader.onload = () => {
+      ASSISTANT_IMAGE = { name: file.name, dataUrl: reader.result };
+      renderAssistant();
+    };
+    reader.readAsDataURL(file);
   });
   document.addEventListener("keydown", (e) => {
     if (e.target.id === "assistantInput" && e.key === "Enter" && !e.shiftKey) {
