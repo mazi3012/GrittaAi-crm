@@ -65,76 +65,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 MAX_TEXT = 4000  # sanity cap for note payloads
-MAX_CHAT_MESSAGES = 24
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-ASSISTANT_MODEL = os.getenv("ASSISTANT_MODEL", os.getenv("MODEL", "stealth/ox-alpha")).strip()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.6-27b").strip()
-
-
-def clean_assistant_reply(text):
-    """Remove reasoning traces some providers include in normal content."""
-    import re
-
-    value = str(text or "")
-    if re.search(r"</think>", value, flags=re.IGNORECASE):
-        value = re.split(r"</think>\s*", value, maxsplit=1,
-                         flags=re.IGNORECASE)[1]
-    else:
-        value = re.sub(r"<think>.*$", "", value,
-                       flags=re.IGNORECASE | re.DOTALL)
-    value = re.sub(r"\[(?:done|proceeds?)\]\s*", "", value,
-                   flags=re.IGNORECASE)
-    return value.strip()
-
-
-def _assistant_provider_request(url, api_key, model, messages, provider):
-    """Call an OpenAI-compatible assistant provider and return its reply."""
-    request_payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": 0.6,
-        "max_tokens": 1200,
-    }
-    if provider == "OpenRouter":
-        request_payload["reasoning"] = {"exclude": True}
-    request_body = json.dumps(request_payload).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=request_body,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": os.getenv("DASHBOARD_URL", "http://localhost"),
-            "X-Title": "Gretta Assistant",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=45) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        if isinstance(data.get("error"), dict):
-            error = data["error"]
-            raise RuntimeError(
-                f"{provider} returned an upstream error: "
-                f"{error.get('code') or error.get('message') or 'unknown error'}"
-            )
-        answer = clean_assistant_reply(
-            ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
-        )
-        if not answer:
-            raise ValueError(f"{provider} returned an empty response")
-        return answer
-    except urllib.error.HTTPError as exc:
-        # Read a short provider response for logs without returning it to users.
-        try:
-            detail = exc.read().decode("utf-8", errors="replace")[:300]
-        except Exception:
-            detail = str(exc)
-        raise RuntimeError(f"{provider} HTTP {exc.code}: {detail}") from exc
-
 app = FastAPI(title="Gretta CRM")
 
 # --------------------------------------------------------------------- auth
@@ -197,17 +127,6 @@ class LoginIn(BaseModel):
     password: str = Field(min_length=1, max_length=200)
 
 
-class AssistantMessage(BaseModel):
-    role: str = Field(pattern="^(user|assistant)$")
-    # Text messages use a string; screenshot messages use the OpenAI-compatible
-    # [{type: "text"}, {type: "image_url"}] content shape.
-    content: str | list[dict]
-
-
-class AssistantChatIn(BaseModel):
-    messages: list[AssistantMessage] = Field(min_length=1, max_length=MAX_CHAT_MESSAGES)
-
-
 @app.get("/api/auth/status")
 def api_auth_status(request: Request):
     """SPA boot check: is a password configured, and do we hold a session?"""
@@ -240,58 +159,6 @@ def api_auth_login(payload: LoginIn, response: Response):
 def api_auth_logout(response: Response):
     response.delete_cookie(COOKIE_NAME)
     return {"ok": True}
-
-
-@app.post("/api/assistant/chat")
-def api_assistant_chat(payload: AssistantChatIn):
-    """Proxy a dashboard assistant conversation without exposing the provider key."""
-    if not OPENROUTER_API_KEY and not GROQ_API_KEY:
-        return JSONResponse(status_code=503, content={
-            "ok": False,
-            "error": "Assistant is not configured. Add OPENROUTER_API_KEY or GROQ_API_KEY."
-        })
-
-    knowledge_path = os.path.join(BASE_DIR, "knowledge.txt")
-    try:
-        with open(knowledge_path, "r", encoding="utf-8") as knowledge_file:
-            knowledge = knowledge_file.read().strip()
-    except OSError:
-        knowledge = "You are Gretta, a practical CRM and sales assistant."
-    system = (
-        "You are Gretta Assistant inside a private CRM dashboard. Be warm, concise, "
-        "and practical. Help with sales follow-ups, lead qualification, outreach "
-        "copy, and CRM workflows. Never claim to have changed CRM data. If the user "
-        "needs a data change, explain that they should use the CRM controls.\n\n"
-        f"TEAM KNOWLEDGE BASE:\n{knowledge}"
-    )
-    messages = [{"role": "system", "content": system}]
-    for message in payload.messages[-MAX_CHAT_MESSAGES:]:
-        content = message.content
-        if isinstance(content, str):
-            content = content[:MAX_TEXT]
-        messages.append({"role": message.role, "content": content})
-    providers = []
-    # Groq is the preferred provider for both text and screenshots. OpenRouter
-    # remains available as a transparent fallback if Groq is unavailable.
-    if GROQ_API_KEY:
-        providers.append((GROQ_URL, GROQ_API_KEY, GROQ_MODEL, "Groq"))
-    if OPENROUTER_API_KEY:
-        providers.append((OPENROUTER_URL, OPENROUTER_API_KEY, ASSISTANT_MODEL, "OpenRouter"))
-
-    errors = []
-    for url, api_key, model, provider in providers:
-        try:
-            answer = _assistant_provider_request(
-                url, api_key, model, messages, provider
-            )
-            return {"ok": True, "message": answer, "model": model, "provider": provider}
-        except (urllib.error.URLError, TimeoutError, ValueError, RuntimeError) as exc:
-            errors.append(f"{provider}: {exc}")
-            print(f"Assistant {provider} error: {exc}")
-
-    return JSONResponse(status_code=502, content={
-        "ok": False, "error": "Gretta could not answer right now. Please try again."
-    })
 
 
 def _lead_dicts():

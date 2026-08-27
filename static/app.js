@@ -37,12 +37,6 @@ let DATA_READY = false;
 let DATA_SIGNATURE = "";
 let LOADING = false;
 let POLL_HANDLE = null;
-let ASSISTANT_MESSAGES = (() => {
-  try { return JSON.parse(localStorage.getItem("gretta-assistant-chat") || "[]"); }
-  catch { return []; }
-})();
-let ASSISTANT_BUSY = false;
-let ASSISTANT_IMAGE = null;
 let TIMER = null, PAUSED = false, LAST_ERR_TOAST = 0;
 
 const $ = (id) => document.getElementById(id);
@@ -790,86 +784,6 @@ function renderAccess() {
   </div>`;
 }
 
-/* ---------- Assistant view ---------- */
-function assistantBubble(message) {
-  const isUser = message.role === "user";
-  const content = Array.isArray(message.content)
-    ? message.content.find(part => part.type === "text")?.text || ""
-    : message.content;
-  const hasImage = Array.isArray(message.content) && message.content.some(part => part.type === "image_url");
-  return `<div class="assistant-message ${isUser ? "from-user" : "from-gretta"}">
-    ${!isUser ? `<span class="assistant-avatar">✦</span>` : ""}
-    <div class="assistant-bubble">${hasImage ? `<div class="assistant-image-label">📷 Screenshot attached</div>` : ""}${esc(content).replace(/\n/g, "<br>")}</div>
-  </div>`;
-}
-
-function assistantImagePreview() {
-  return ASSISTANT_IMAGE ? `<div class="assistant-attachment">
-    <img src="${ASSISTANT_IMAGE.dataUrl}" alt="Screenshot preview">
-    <div><strong>${esc(ASSISTANT_IMAGE.name)}</strong><small>Ready for vision analysis</small></div>
-    <button type="button" id="removeAssistantImage" title="Remove screenshot">×</button>
-  </div>` : "";
-}
-
-function renderAssistant() {
-  const el = $("view-assistant");
-  if (!el) return;
-  const messages = ASSISTANT_MESSAGES.length ? ASSISTANT_MESSAGES.map(assistantBubble).join("") : `
-    <div class="assistant-welcome">
-      <span class="assistant-welcome-icon">✦</span>
-      <h2>Talk to Gretta</h2>
-      <p>Your private sales copilot is ready. Ask for outreach ideas, lead qualification help, or a follow-up plan.</p>
-      <div class="assistant-suggestions">
-        <button data-assistant-prompt="Write a friendly follow-up for a lead who saw my message but did not reply.">✍️ Write a follow-up</button>
-        <button data-assistant-prompt="How should I qualify a new Instagram lead?">🎯 Qualify a lead</button>
-        <button data-assistant-prompt="Give me a simple plan for today's outreach.">⚡ Plan my day</button>
-      </div>
-    </div>`;
-  el.innerHTML = `<div class="assistant-shell">
-    <div class="assistant-header glass">
-      <div class="assistant-heading"><span class="assistant-avatar large">✦</span><div><h1>Assistant</h1><p><span class="assistant-online-dot"></span> Gretta is online · CRM-aware sales guidance</p></div></div>
-      <button class="mini-btn" id="clearAssistantBtn" ${ASSISTANT_MESSAGES.length ? "" : "disabled"}>⌫ Clear chat</button>
-    </div>
-    <div class="assistant-chat glass" id="assistantChat">${messages}${ASSISTANT_BUSY ? `<div class="assistant-message from-gretta"><span class="assistant-avatar">✦</span><div class="assistant-bubble assistant-typing"><i></i><i></i><i></i></div></div>` : ""}</div>
-    <form class="assistant-composer glass" id="assistantForm">
-      ${assistantImagePreview()}
-      <textarea id="assistantInput" rows="1" maxlength="4000" placeholder="Message Gretta…" ${ASSISTANT_BUSY ? "disabled" : ""}></textarea>
-      <input id="assistantImageInput" type="file" accept="image/png,image/jpeg,image/webp" hidden ${ASSISTANT_BUSY ? "disabled" : ""}>
-      <button class="assistant-attach" type="button" id="assistantAttachBtn" title="Upload a screenshot" ${ASSISTANT_BUSY ? "disabled" : ""}>📎</button>
-      <button class="assistant-send" type="submit" title="Send message" ${ASSISTANT_BUSY ? "disabled" : ""}>➤</button>
-    </form>
-    <div class="assistant-disclaimer">Gretta can make mistakes. Verify important decisions before acting.</div>
-  </div>`;
-  const chat = $("assistantChat");
-  if (chat) chat.scrollTop = chat.scrollHeight;
-  const input = $("assistantInput");
-  if (input) input.focus();
-}
-
-async function sendAssistant(text) {
-  const content = (text || "").trim();
-  if ((!content && !ASSISTANT_IMAGE) || ASSISTANT_BUSY) return;
-  const userContent = ASSISTANT_IMAGE ? [
-    { type: "text", text: content || "Analyze this screenshot and tell me what I should do next." },
-    { type: "image_url", image_url: { url: ASSISTANT_IMAGE.dataUrl } },
-  ] : content;
-  ASSISTANT_MESSAGES.push({ role: "user", content: userContent });
-  ASSISTANT_IMAGE = null;
-  localStorage.setItem("gretta-assistant-chat", JSON.stringify(ASSISTANT_MESSAGES));
-  ASSISTANT_BUSY = true;
-  renderAssistant();
-  try {
-    const data = await api("/api/assistant/chat", { method: "POST", body: { messages: ASSISTANT_MESSAGES } });
-    ASSISTANT_MESSAGES.push({ role: "assistant", content: data.message });
-  } catch (err) {
-    ASSISTANT_MESSAGES.push({ role: "assistant", content: `I’m sorry, I couldn’t answer just now. ${err.message}` });
-  } finally {
-    localStorage.setItem("gretta-assistant-chat", JSON.stringify(ASSISTANT_MESSAGES));
-    ASSISTANT_BUSY = false;
-    renderAssistant();
-  }
-}
-
 /* ---------- auth gate ---------- */
 function showLogin() { const g = $("loginGate"); if (g) g.style.display = "flex"; }
 function hideLogin() { const g = $("loginGate"); if (g) g.style.display = "none"; }
@@ -960,7 +874,6 @@ function render() {
   else if (VIEW === "leads") renderLeads();
   else if (VIEW === "board") renderBoard();
   else if (VIEW === "access") renderAccess();
-  else if (VIEW === "assistant") renderAssistant();
 }
 function switchView(v) {
   VIEW = v;
@@ -978,7 +891,7 @@ function switchView(v) {
 }
 function viewFromHash() {
   const v = location.hash.replace("#", "");
-  return ["overview", "team", "leads", "board", "access", "assistant"].includes(v) ? v : "overview";
+  return ["overview", "team", "leads", "board", "access"].includes(v) ? v : "overview";
 }
 
 /* ---------- command palette ---------- */
@@ -987,7 +900,7 @@ function closeCmdk() { $("cmdk").classList.remove("show"); }
 function buildCmdk(q) {
   q = q.trim().toLowerCase();
   const views = [["overview", "📊 Overview"], ["team", "👥 Team"], ["leads", "🗂 Leads table"],
-                 ["board", "📌 Board"], ["access", "🔐 Bot access"], ["assistant", "✦ Assistant"]]
+                 ["board", "📌 Board"], ["access", "🔐 Bot access"]]
     .filter(([v]) => !q || v.includes(q) );
   const leads = LEADS.filter(l => !q || `${l.user_name} ${l.full_name}`.toLowerCase().includes(q))
     .slice(0, 8);
@@ -1103,42 +1016,6 @@ function wireEvents() {
     window.__qT = setTimeout(render, 180);
   });
   $("hamburger").addEventListener("click", () => $("sidebar").classList.toggle("open"));
-  document.addEventListener("submit", (e) => {
-    if (e.target.id === "assistantForm") {
-      e.preventDefault();
-      const input = $("assistantInput");
-      sendAssistant(input.value);
-    }
-  });
-  document.addEventListener("click", (e) => {
-    const prompt = e.target.closest("[data-assistant-prompt]");
-    if (prompt) sendAssistant(prompt.dataset.assistantPrompt);
-    if (e.target.closest("#clearAssistantBtn")) {
-      ASSISTANT_MESSAGES = [];
-      localStorage.removeItem("gretta-assistant-chat");
-      renderAssistant();
-    }
-    if (e.target.closest("#assistantAttachBtn")) $("assistantImageInput")?.click();
-    if (e.target.closest("#removeAssistantImage")) { ASSISTANT_IMAGE = null; renderAssistant(); }
-  });
-  document.addEventListener("change", (e) => {
-    if (e.target.id !== "assistantImageInput" || !e.target.files?.[0]) return;
-    const file = e.target.files[0];
-    if (!file.type.startsWith("image/")) return toast("Please choose an image file", "err");
-    const reader = new FileReader();
-    reader.onload = () => {
-      ASSISTANT_IMAGE = { name: file.name, dataUrl: reader.result };
-      renderAssistant();
-    };
-    reader.readAsDataURL(file);
-  });
-  document.addEventListener("keydown", (e) => {
-    if (e.target.id === "assistantInput" && e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      const input = e.target;
-      sendAssistant(input.value);
-    }
-  });
   // Auto-close the mobile sidebar whenever a nav destination is picked.
   // NOTE: #sidebar is an ID, not a class — the old ".sidebar .nav-btn"
   // selector matched nothing, which is why the menu never closed itself.
