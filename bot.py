@@ -578,6 +578,16 @@ def sender_handle(message):
     return _setter_identity(user.username, user.first_name)
 
 
+def callback_sender_handle(call):
+    """Return the setter who clicked an inline Telegram button.
+
+    ``call.message.from_user`` is the bot, because the bot sent the message.
+    The actual person who tapped the button is ``call.from_user``.
+    """
+    user = call.from_user
+    return _setter_identity(user.username, user.first_name)
+
+
 def lead_card(lead):
     """Render a lead dict (db.get_lead) as an HTML card."""
     uname = lead["user_name"]
@@ -1522,9 +1532,9 @@ def on_menu(call):
     data = call.data
     if data == "menu:home":
         text = welcome_text(call.from_user.first_name or "there")
-        kb = main_menu_kb(sender_handle(call.message))
+        kb = main_menu_kb(callback_sender_handle(call))
     elif data == "menu:leads":
-        viewer = sender_handle(call.message)
+        viewer = callback_sender_handle(call)
         rows = my_leads_for(viewer)
         text, btns = render_my_leads(rows)
         kb = leads_kb(btns)
@@ -1532,11 +1542,11 @@ def on_menu(call):
         text = stats_text()
         kb = home_button_kb()
     elif data == "menu:followups":
-        viewer = sender_handle(call.message)
+        viewer = callback_sender_handle(call)
         text, btns = render_followups(my_leads_for(viewer))
         kb = leads_kb(btns)
     elif data == "ask:add":
-        if followup_block_message(chat_id, sender_handle(call.message)):
+        if followup_block_message(chat_id, callback_sender_handle(call)):
             bot.answer_callback_query(call.id)
             return
         _pending_add[chat_id] = {"step": "username", "data": {}}
@@ -1642,8 +1652,8 @@ def on_lead_action(call):
         lead = update_lead(username, **fields)
         toast = f"🔁 Follow up {n} done"
     elif action == "take":
-        lead = update_lead(username, sender_name=sender_handle(call.message))
-        toast = f"🙋 Taken by {sender_handle(call.message)}"
+        lead = update_lead(username, sender_name=callback_sender_handle(call))
+        toast = f"🙋 Taken by {callback_sender_handle(call)}"
     elif action == "del":
         delete_lead(username)
         try:
@@ -1656,6 +1666,9 @@ def on_lead_action(call):
         bot.answer_callback_query(call.id, "🗑 Deleted")
         return
     elif action == "add":
+        if followup_block_message(chat_id, viewer):
+            bot.answer_callback_query(call.id)
+            return
         _pending_add[chat_id] = {"step": "name", "data": {"user_name": username}}
         _ask_add_step(chat_id, "name")
         bot.answer_callback_query(call.id)
