@@ -711,8 +711,38 @@ def render_my_leads(rows):
     return "\n".join(lines), buttons
 
 
+def followup_card_keyboard(username, stage, profile):
+    """Actions belonging only to one follow-up card."""
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        types.InlineKeyboardButton("↗ Open profile", url=profile),
+        types.InlineKeyboardButton(
+            f"✅ Done FU{stage}", callback_data=f"fu_done:{username}:{stage}"),
+    )
+    kb.add(types.InlineKeyboardButton(
+        "❌ End follow-up", callback_data=f"fu_end:{username}"))
+    return kb
+
+
+def render_followup_card(lead, stage, due, when):
+    """Render one lead's current follow-up card and its matching actions."""
+    username = lead["user_name"]
+    name = lead["full_name"] or username
+    profile = lead.get("profile_link") or profile_link_for(username)
+    marker = "🔔" if due else ("📅" if when else "🗓")
+    text = (
+        f"<b>👤 {esc(name)}</b> {esc(username)}\n"
+        f"{marker} FU{stage} · {esc(when or 'not scheduled')}\n"
+        f"{status_chip(lead.get('status', ''))} Status: "
+        f"{esc(lead.get('status') or 'Not set')}\n"
+        f"🔗 <a href=\"{esc(profile)}\">Open Instagram profile</a>\n"
+        "━━━━━━━━━━━━━━━━"
+    )
+    return text, followup_card_keyboard(username, stage, profile)
+
+
 def render_followups(rows):
-    """Show pending follow-ups as grouped, actionable lead cards."""
+    """Return a header and separate actionable card for every pending lead."""
     header = "🔁 <b>My Follow-ups</b>\n\n"
     today = today_str()
     grouped = {stage: [] for stage in (1, 2, 3, 4)}
@@ -730,7 +760,7 @@ def render_followups(rows):
 
     pending_rows = [item for stage in grouped.values() for item in stage]
     if not pending_rows:
-        return header + "✅ You have no pending follow-ups.", []
+        return [(header + "✅ You have no pending follow-ups.", home_button_kb())]
 
     due_count = sum(1 for _, due, _ in pending_rows if due)
     unscheduled_count = sum(1 for _, _, when in pending_rows if not when)
@@ -740,34 +770,14 @@ def render_followups(rows):
     if unscheduled_count:
         summary.append(f"🗓 Unscheduled: <b>{unscheduled_count}</b>")
 
-    stage_names = {1: "First", 2: "Second", 3: "Third", 4: "Fourth"}
-    lines = [" · ".join(summary), ""]
-    buttons = []
+    cards = [(header + " · ".join(summary), home_button_kb())]
     for stage, stage_rows in grouped.items():
         if not stage_rows:
             continue
         stage_rows.sort(key=lambda item: (not item[1], not bool(item[2]), item[2] or ""))
-        lines.append(f"<b>FU{stage} · {stage_names[stage]} follow-up</b> ({len(stage_rows)})")
         for lead, due, when in stage_rows:
-            username = lead["user_name"]
-            name = lead["full_name"] or username
-            profile = lead.get("profile_link") or profile_link_for(username)
-            marker = "🔔" if due else ("📅" if when else "🗓")
-            lines.append(
-                f"<b>┌ {esc(name)}</b> {esc(username)}\n"
-                f"{marker} FU{stage} · {esc(when or 'not scheduled')}\n"
-                f"🔗 <a href=\"{esc(profile)}\">Open Instagram profile</a>\n"
-                "└────────────────"
-            )
-            buttons.extend([
-                types.InlineKeyboardButton("↗ Profile", url=profile),
-                types.InlineKeyboardButton(
-                    f"✅ Done FU{stage}", callback_data=f"fu_done:{username}:{stage}"),
-                types.InlineKeyboardButton(
-                    "❌ End follow-up", callback_data=f"fu_end:{username}"),
-            ])
-        lines.append("")
-    return header + "\n".join(lines).rstrip(), buttons
+            cards.append(render_followup_card(lead, stage, due, when))
+    return cards
 
 
 def leads_kb(buttons):
@@ -776,6 +786,21 @@ def leads_kb(buttons):
         kb.add(*buttons)
     kb.add(types.InlineKeyboardButton("🏠 Home", callback_data="menu:home"))
     return kb
+
+
+def send_followup_cards(chat_id, viewer):
+    """Send the follow-up summary and one message per lead card."""
+    for text, keyboard in render_followups(my_leads_for(viewer)):
+        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=keyboard)
+
+
+def refresh_followup_cards(call):
+    """Remove the completed/ended card while leaving other cards in place."""
+    chat_id = call.message.chat.id
+    try:
+        bot.delete_message(chat_id, call.message.message_id)
+    except Exception:
+        pass
 
 
 def followup_block_message(chat_id, viewer):
@@ -1108,9 +1133,7 @@ def handle_fup(message):
 @member_only
 def handle_followups(message):
     """Show all assigned follow-ups on demand."""
-    text, buttons = render_followups(my_leads_for(sender_handle(message)))
-    bot.send_message(message.chat.id, text, parse_mode="HTML",
-                     reply_markup=leads_kb(buttons))
+    send_followup_cards(message.chat.id, sender_handle(message))
 
 
 @bot.message_handler(commands=["next"])
@@ -1549,8 +1572,8 @@ def on_menu(call):
         kb = home_button_kb()
     elif data == "menu:followups":
         viewer = callback_sender_handle(call)
-        text, btns = render_followups(my_leads_for(viewer))
-        kb = leads_kb(btns)
+        cards = render_followups(my_leads_for(viewer))
+        text, kb = cards[0]
     elif data == "ask:add":
         if followup_block_message(chat_id, callback_sender_handle(call)):
             bot.answer_callback_query(call.id)
@@ -1581,6 +1604,9 @@ def on_menu(call):
         if "message is not modified" not in str(exc).lower():
             bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
     bot.answer_callback_query(call.id)
+    if data == "menu:followups":
+        for card_text, card_kb in cards[1:]:
+            bot.send_message(chat_id, card_text, parse_mode="HTML", reply_markup=card_kb)
 
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("lead:"))
@@ -1740,13 +1766,7 @@ def on_followup_done(call):
         bot.answer_callback_query(call.id, "That follow-up is no longer pending.", show_alert=True)
         return
     lead = update_lead(username, **{f"follow_up_{stage}": "Yes"})
-    viewer = callback_sender_handle(call)
-    text, buttons = render_followups(my_leads_for(viewer))
-    try:
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
-                              parse_mode="HTML", reply_markup=leads_kb(buttons))
-    except Exception:
-        pass
+    refresh_followup_cards(call)
     bot.answer_callback_query(call.id, f"✅ FU{stage} completed")
 
 
@@ -1759,13 +1779,7 @@ def on_followup_end(call):
     if not lead:
         bot.answer_callback_query(call.id, "Lead no longer exists.", show_alert=True)
         return
-    viewer = callback_sender_handle(call)
-    text, buttons = render_followups(my_leads_for(viewer))
-    try:
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
-                              parse_mode="HTML", reply_markup=leads_kb(buttons))
-    except Exception:
-        pass
+    refresh_followup_cards(call)
     bot.answer_callback_query(call.id, "❌ Follow-up ended — marked Not Interested")
 
 
