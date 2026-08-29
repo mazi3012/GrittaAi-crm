@@ -59,9 +59,9 @@ OLD_TO_STATUS = {
     "Cancelled": "Not Interested", "Lost": "Lost",
 }
 
-# The 27 sheet columns in exact tab order -> field names used everywhere.
+# The 28 sheet columns in exact tab order -> field names used everywhere.
 LEAD_FIELDS = (
-    "lead_number", "full_name", "user_name", "profile_link",
+    "lead_number", "full_name", "email", "user_name", "profile_link",
     "followers_count", "sender_name", "sender_profile",
     "first_touchpoint", "note", "status", "last_touchpoint",
     "next_touchpoint", "replied", "number_received", "number",
@@ -85,6 +85,7 @@ _SCHEMA = (
     CREATE TABLE IF NOT EXISTS leads (
         lead_number INTEGER DEFAULT 0,
         full_name TEXT DEFAULT '',
+        email TEXT DEFAULT '',
         user_name TEXT PRIMARY KEY,
         profile_link TEXT DEFAULT '',
         followers_count TEXT DEFAULT '',
@@ -203,6 +204,8 @@ def init_db():
             # Never alter or remove existing access/lead data.
             if "chat_id" not in _table_columns(conn, "bot_users"):
                 conn.execute("ALTER TABLE bot_users ADD COLUMN chat_id TEXT")
+            if "email" not in _table_columns(conn, "leads"):
+                conn.execute("ALTER TABLE leads ADD COLUMN email TEXT DEFAULT ''")
             if legacy:
                 _import_legacy_rows(conn, legacy)
             conn.commit()
@@ -265,7 +268,7 @@ def _notify_sheet(reason):
         pass
 
 
-def add_lead(user_name, full_name="", sender_name="", followers_count="",
+def add_lead(user_name, full_name="", email="", sender_name="", followers_count="",
              note="", status="Message Sent", sender_profile="",
              number=""):
     """Create a lead for a setter; returns (lead_dict, created).
@@ -291,13 +294,13 @@ def add_lead(user_name, full_name="", sender_name="", followers_count="",
         with _write_lock:
             num = _next_lead_number(conn, sender)
             conn.execute(
-                f"INSERT INTO leads (lead_number, full_name, user_name, "
+                f"INSERT INTO leads (lead_number, full_name, email, user_name, "
                 f"profile_link, followers_count, sender_name, sender_profile, "
                 f"first_touchpoint, note, status, last_touchpoint, number, "
                 f"number_received) "
-                f"VALUES ({_PH}, {_PH}, {_PH}, {_PH}, {_PH}, {_PH}, {_PH}, "
+                f"VALUES ({_PH}, {_PH}, {_PH}, {_PH}, {_PH}, {_PH}, {_PH}, {_PH}, "
                 f"{_PH}, {_PH}, {_PH}, {_PH}, {_PH}, {_PH})",
-                (num, (full_name or "").strip(), uname,
+                (num, (full_name or "").strip(), (email or "").strip(), uname,
                  profile_link_for(uname), (followers_count or "").strip(),
                  sender, (sender_profile or "").strip(), today,
                  (note or "").strip(), status, today,

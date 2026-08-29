@@ -640,6 +640,7 @@ function renderDrawer(l) {
     <div style="display:flex;flex-direction:column;gap:6px;font-size:12.5px;color:var(--txt-2);">
       ${l.profile_link ? `<a href="${esc(l.profile_link)}" target="_blank" rel="noopener" style="color:var(--brand);text-decoration:none;">🔗 ${esc(l.profile_link)}</a>` : ""}
       <span>👥 Followers: <b>${esc(l.followers_count || "—")}</b></span>
+      ${l.email ? `<span>✉️ Email: <a href="mailto:${esc(l.email)}" style="color:var(--brand);">${esc(l.email)}</a></span>` : ""}
       <span>🧑‍💼 Setter: ${setterPill(l.sender_name)}</span>
       <span>🕒 1st: <b>${esc(l.first_touchpoint || "—")}</b> · last: <b>${esc(l.last_touchpoint || "—")}</b></span>
     </div>
@@ -649,6 +650,8 @@ function renderDrawer(l) {
     <div class="drawer-label">Details</div>
     <label style="font-size:12px;color:var(--txt-3);display:block;margin-bottom:4px;">Full name</label>
     <input id="fullNameInput" class="inline-edit" value="${esc(l.full_name || "")}" placeholder="Prospect's real name"/>
+    <label style="font-size:12px;color:var(--txt-3);display:block;margin:9px 0 4px;">Email</label>
+    <input id="emailInput" type="email" class="inline-edit" value="${esc(l.email || "")}" placeholder="lead@example.com"/>
     <label style="font-size:12px;color:var(--txt-3);display:block;margin:9px 0 4px;">Followers count</label>
     <input id="followersInput" class="inline-edit mono" value="${esc(l.followers_count || "")}" placeholder="e.g. 12.5k"/>
     <div style="display:flex;justify-content:flex-end;margin-top:8px;">
@@ -724,7 +727,7 @@ function renderDrawer(l) {
 
 /* ---------- CSV export : exact Google Sheet column order ---------- */
 const SHEET_COLS = [["lead_number", "Lead Number"], ["full_name", "Full Name (Lead)"],
-  ["user_name", "User name (Lead)"], ["profile_link", "Profile Link"],
+  ["email", "Email"], ["user_name", "User name (Lead)"], ["profile_link", "Profile Link"],
   ["followers_count", "Followers Count"], ["sender_name", "Sender Name"],
   ["sender_profile", "Sender Profile"], ["first_touchpoint", "First Touchpoint (Date)"],
   ["note", "Note"], ["status", "Status"], ["last_touchpoint", "Last Touchpoint (Date)"],
@@ -951,6 +954,7 @@ function wireDrawerEvents() {
       await api("/api/lead/update", { method: "POST", body: {
         username: DRAWER_USER,
         full_name: $("fullNameInput").value.trim(),
+        email: $("emailInput").value.trim(),
         followers_count: $("followersInput").value.trim(),
       } });
       toast("Details saved"); await load({ silent: true }); openDrawer(DRAWER_USER);

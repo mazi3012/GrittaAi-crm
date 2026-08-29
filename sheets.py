@@ -34,9 +34,9 @@ SHEET_SECRET = os.getenv("GOOGLE_SHEET_SECRET", "").strip()
 
 COALESCE_SECONDS = 8.0  # quiet window before a queued push actually fires
 
-# The 27 columns of every setter tab, in the sheet's exact order.
+# The 28 columns of every setter tab, in the sheet's exact order.
 HEADERS = (
-    "Lead Number", "Full Name (Lead)", "User name (Lead)", "Profile Link",
+    "Lead Number", "Full Name (Lead)", "Email", "User name (Lead)", "Profile Link",
     "Followers Count", "Sender Name", "Sender Profile",
     "First Touchpoint (Date)", "Note", "Status", "Last Touchpoint (Date)",
     "Next Touchpoint (Date)", "Replied", "Number Received", "Number",
@@ -49,6 +49,7 @@ HEADERS = (
 HEADER_TO_FIELD = {
     "Lead Number": "lead_number",
     "Full Name (Lead)": "full_name",
+    "Email": "email",
     "User name (Lead)": "user_name",
     "Profile Link": "profile_link",
     "Followers Count": "followers_count",

@@ -79,13 +79,13 @@ from db import (  # noqa: E402  (after env validation)
     find_bot_user,
     get_lead,
     normalize_username,
+    overdue_leads_for_sender,
     profile_link_for,
     set_bot_user_authorized,
     today_str,
     track_bot_user,
     update_lead,
     next_followup_date,
-    overdue_leads_for_sender,
 )
 import sheets  # noqa: E402  Google Sheets mirror (no-op unless configured)
 
@@ -243,15 +243,31 @@ def clean_ai_reply(text):
     return value.strip()
 
 
-def main_menu_kb():
+def main_menu_kb(viewer=None):
     """Main app menu shown by /start and the 🏠 Home button."""
     kb = types.InlineKeyboardMarkup(row_width=2)
+    followup_label = "🔁 Follow-ups"
+    if viewer:
+        pending = overdue_leads_for_sender(viewer)
+        due_stages = {}
+        for lead in pending:
+            stage = next((n for n in (1, 2, 3, 4)
+                          if lead[f"follow_up_{n}"] != "Yes"), None)
+            if stage:
+                due_stages[stage] = due_stages.get(stage, 0) + 1
+        if due_stages:
+            detail = ", ".join(f"FU{stage}: {count}"
+                                for stage, count in sorted(due_stages.items()))
+            followup_label += f" ({detail})"
     kb.add(
         types.InlineKeyboardButton("🗂 My Leads", callback_data="menu:leads"),
         types.InlineKeyboardButton("➕ Add Lead", callback_data="ask:add"),
     )
     kb.add(
         types.InlineKeyboardButton("📊 Team Stats", callback_data="menu:stats"),
+        types.InlineKeyboardButton(followup_label, callback_data="menu:followups"),
+    )
+    kb.add(
         types.InlineKeyboardButton("💬 Talk to Gretta", callback_data="ask:chat"),
     )
     if DASHBOARD_URL:
@@ -273,6 +289,7 @@ def welcome_text(name):
         "• ➕ <b>/addlead</b> — log a new prospect (guided)\n"
         "• 🗂 <b>/myleads</b> — browse & manage your leads\n"
         "• 📊 <b>/stats</b> — team pipeline at a glance\n"
+        "• 🔁 <b>/followups</b> — see your assigned follow-ups\n"
         "• 🔄 <b>/importsheet</b> — pull your Google Sheet into the CRM\n"
         "• 💬 Or just <b>talk to me</b> — ask anything!\n\n"
         "👇 Use the buttons below or type a command."
@@ -291,6 +308,7 @@ def register_bot_commands():
             types.BotCommand("note", "Append a note — /note @user <text>"),
             types.BotCommand("number", "Save a number — /number @user <num>"),
             types.BotCommand("fup", "Follow-up done — /fup @user <1-4>"),
+            types.BotCommand("followups", "See my assigned follow-ups"),
             types.BotCommand("stats", "Team pipeline summary"),
             types.BotCommand("importsheet", "Pull leads from Google Sheet"),
             types.BotCommand("syncsheet", "Push CRM to Google Sheet"),
@@ -354,7 +372,7 @@ SYSTEM_PROMPT = (
 ANALYSIS_INSTRUCTIONS = (
     "Analyze this sales conversation screenshot directly and reply with ONLY a single JSON object "
     "(no markdown fences, no extra text) using exactly these keys:\n"
-    '{"lead": "@username", "score": "HIGH|MEDIUM|LOW", '
+    '{"lead": "@username", "email": "client@example.com", "score": "HIGH|MEDIUM|LOW", '
     '"platform": "Instagram|WhatsApp|IndiaMART", '
     '"stage": "New|Contacted|Meeting Booked|Converted|Lost", '
     '"next_steps": "short actionable instruction", '
@@ -367,7 +385,8 @@ ANALYSIS_INSTRUCTIONS = (
     "(left side), never our own replies (right side).\n"
     "- A client asking about price or service = interest = HIGH/MEDIUM "
     "score. Do NOT score based on what WE promised.\n\n"
-    "Identify the client's username/handle from the image header or layout if visible. "
+    "Identify the client's username/handle and email address from the image if visible. "
+    "If no email is visible, set email to an empty string. "
     "Use the provided target username if none is found in the screenshot."
 )
 
@@ -541,9 +560,22 @@ def ask_ai(prompt_text, image_bytes=None, timeout=90):
 
 
 # --------------------------------------------------------------- handlers
+PRIMARY_SETTER_USERNAME = "@mazidur"
+PRIMARY_SETTER_NAME = "Mazidur Rahman"
+
+
+def _setter_identity(username=None, first_name=None):
+    """Return the canonical display name used for lead ownership."""
+    handle = (username or "").strip().lower()
+    name = (first_name or "").strip().lower()
+    if handle.lstrip("@") == PRIMARY_SETTER_USERNAME.lstrip("@") or name == "mazidur":
+        return PRIMARY_SETTER_NAME
+    return f"@{handle.lstrip('@')}" if handle else (first_name or "Unknown")
+
+
 def sender_handle(message):
     user = message.from_user
-    return f"@{user.username}" if user.username else (user.first_name or "Unknown")
+    return _setter_identity(user.username, user.first_name)
 
 
 def lead_card(lead):
@@ -574,6 +606,13 @@ def lead_card(lead):
         if lead[f"follow_up_{n}"] == "Yes":
             when = lead[f"follow_up_{n}_date"]
             flags.append(f"🔁 FU{n} ✓{(' ' + when) if when else ''}")
+    next_fu = next((n for n in (1, 2, 3, 4)
+                    if lead[f"follow_up_{n}"] != "Yes"), None)
+    if next_fu:
+        due = (lead.get("next_touchpoint") or "") <= today_str()
+        flags.append(f"{'🔔' if due else '📅'} FU{next_fu} pending")
+    else:
+        flags.append("✅ Follow-ups complete")
     if lead["discovery_call"] == "Yes":
         when = f" {lead['discovery_date']}" if lead["discovery_date"] else ""
         flags.append(f"📅 discovery{when}")
@@ -661,6 +700,60 @@ def render_my_leads(rows):
     return "\n".join(lines), buttons
 
 
+def render_followups(rows):
+    """Show a setter's follow-up workload with tappable lead cards."""
+    header = "🔁 <b>My Follow-ups</b>\n\n"
+    if not rows:
+        return header + "You don't have any assigned leads yet.", []
+
+    today = today_str()
+    groups = []
+    buttons = []
+    total_pending = 0
+    total_due = 0
+    for n in (1, 2, 3, 4):
+        # Each lead belongs to its next unfinished follow-up, not to every
+        # later stage in the sequence.
+        pending = []
+        for lead in rows:
+            next_n = next((i for i in (1, 2, 3, 4)
+                           if lead[f"follow_up_{i}"] != "Yes"), None)
+            if next_n == n:
+                pending.append(lead)
+        if not pending:
+            continue
+        due = [lead for lead in pending
+               if lead.get("next_touchpoint") and lead["next_touchpoint"] <= today]
+        upcoming = [lead for lead in pending if lead not in due]
+        total_pending += len(pending)
+        total_due += len(due)
+        groups.append(f"<b>Follow-up {n}</b>: {len(pending)} pending · "
+                      f"{len(due)} due · {len(upcoming)} upcoming")
+        for lead in due + upcoming:
+            username = lead["user_name"]
+            name = lead["full_name"] or username
+            when = lead.get("next_touchpoint") or "not scheduled"
+            marker = "🔔" if lead in due else "📅"
+            groups.append(f"  {marker} {esc(name)} {esc(username)} — {esc(when)}")
+            cb = f"lead:{username}"
+            if len(cb.encode()) <= 64:
+                buttons.append(types.InlineKeyboardButton(
+                    f"FU{n} · {username}", callback_data=cb))
+
+    completed = sum(
+        1 for lead in rows for n in (1, 2, 3, 4)
+        if lead[f"follow_up_{n}"] == "Yes"
+    )
+    if not groups:
+        text = header + f"✅ All follow-ups completed for your {len(rows)} leads."
+    else:
+        text = (header + f"Assigned leads: <b>{len(rows)}</b> · "
+                f"Pending follow-ups: <b>{total_pending}</b> · "
+                f"Due now: <b>{total_due}</b> · Completed: <b>{completed}</b>\n\n" +
+                "\n".join(groups))
+    return text, buttons
+
+
 def leads_kb(buttons):
     kb = types.InlineKeyboardMarkup(row_width=2)
     if buttons:
@@ -669,14 +762,37 @@ def leads_kb(buttons):
     return kb
 
 
+def followup_block_message(chat_id, viewer):
+    """Prevent new lead creation while this setter has an unfinished follow-up."""
+    terminal = {"Replied-No yet booked", "Number received", "Closing Call",
+                "Discovery Call booked", "Not Interested", "Lost", "Won"}
+    blocked = [lead for lead in my_leads_for(viewer)
+               if lead.get("status") not in terminal and
+               any(lead[f"follow_up_{n}"] != "Yes" for n in (1, 2, 3, 4))]
+    if not blocked:
+        return False
+    names = ", ".join(x["user_name"] for x in blocked[:8])
+    next_stage = next((n for n in (1, 2, 3, 4)
+                       if blocked[0][f"follow_up_{n}"] != "Yes"), 1)
+    bot.send_message(
+        chat_id,
+        "⛔ <b>Complete your follow-up before adding a new lead.</b>\n\n"
+        f"Pending: {esc(names)}\n"
+        f"Open Follow-ups, or use <code>/fup @username {next_stage}</code> "
+        "(use the pending number), then try again.",
+        parse_mode="HTML", reply_markup=home_button_kb())
+    return True
+
+
 @bot.message_handler(commands=["start"])
 @member_only
 def send_welcome(message):
+    viewer = sender_handle(message)
     bot.send_message(
         message.chat.id,
         welcome_text(message.from_user.first_name or "there"),
         parse_mode="HTML",
-        reply_markup=main_menu_kb(),
+        reply_markup=main_menu_kb(viewer),
     )
 
 
@@ -741,7 +857,7 @@ def _process_add_step(message, state):
             return True
         try:
             lead, created = add_lead(
-                full_name=data.get("full_name", ""), user_name=uname,
+                full_name=data.get("full_name", ""), email=data.get("email", ""), user_name=uname,
                 sender_name=sender_handle(message),
                 followers_count=data.get("followers_count", ""),
                 note=data.get("note", ""))
@@ -769,15 +885,7 @@ def handle_addlead(message):
     """Guided lead creation: @username -> name -> followers -> note."""
     chat_id = message.chat.id
     # Apply the same gate to both the one-line and guided /addlead flows.
-    blocked = overdue_leads_for_sender(sender_handle(message))
-    if blocked:
-        names = ", ".join(x["user_name"] for x in blocked[:8])
-        bot.send_message(
-            chat_id,
-            "⛔ <b>Follow-up required before adding a new lead.</b>\n\n"
-            f"Overdue: {esc(names)}\n"
-            "Complete it with <code>/fup @username 1</code> (or the next number), "
-            "then try again.", parse_mode="HTML")
+    if followup_block_message(chat_id, sender_handle(message)):
         return
     parts = (message.text or "").split(maxsplit=1)
     target = None
@@ -980,55 +1088,13 @@ def handle_fup(message):
                      parse_mode="HTML", reply_markup=home_button_kb())
 
 
-@bot.message_handler(commands=["reminders"])
+@bot.message_handler(commands=["followups"])
 @member_only
-def handle_reminders(message):
-    """Show due follow-ups; used by the periodic notifier and teammates."""
-    owner = sender_handle(message)
-    due = overdue_leads_for_sender(owner)
-    if not due:
-        bot.send_message(message.chat.id, "✅ No overdue follow-ups.", reply_markup=home_button_kb())
-        return
-    lines = [f"🔔 <b>{len(due)} follow-up(s) due</b> for {esc(owner)}", ""]
-    for lead in due[:25]:
-        lines.append(
-            f"• <a href=\"{esc(lead['profile_link'])}\">{esc(lead['user_name'])}</a> "
-            f"— due {esc(lead['next_touchpoint'])} — <code>/fup {esc(lead['user_name'])} "
-            f"{min(int(lead.get('follow_up_1') == 'Yes') + int(lead.get('follow_up_2') == 'Yes') + int(lead.get('follow_up_3') == 'Yes') + int(lead.get('follow_up_4') == 'Yes') + 1, 4)}</code>"
-        )
-    bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML",
-                     disable_web_page_preview=True, reply_markup=home_button_kb())
-
-
-def send_due_followup_reminders():
-    """Send one daily reminder to each stored setter chat ID.
-
-    Telegram chat IDs are captured from real interactions, so no manual
-    mapping is needed for Mazidur Rahman or the existing team users.
-    """
-    for row in all_bot_users():
-        telegram_id, username, _first_name, authorized = row[:4]
-        if not authorized and not OPEN_ACCESS:
-            continue
-        owner = username or ""
-        due = overdue_leads_for_sender(owner)
-        if not due:
-            continue
-        try:
-            bot.send_message(telegram_id, f"🔔 You have {len(due)} overdue follow-up(s). Use /reminders to see them.")
-        except Exception as exc:
-            print(f"Reminder delivery failed for {telegram_id}: {exc}")
-
-
-def _reminder_loop():
-    """Run the notifier once per day without changing polling behavior."""
-    last_run = ""
-    while True:
-        today = today_str()
-        if today != last_run:
-            send_due_followup_reminders()
-            last_run = today
-        time.sleep(300)
+def handle_followups(message):
+    """Show all assigned follow-ups on demand."""
+    text, buttons = render_followups(my_leads_for(sender_handle(message)))
+    bot.send_message(message.chat.id, text, parse_mode="HTML",
+                     reply_markup=leads_kb(buttons))
 
 
 @bot.message_handler(commands=["next"])
@@ -1332,6 +1398,9 @@ def analyze_and_reply(status, image_bytes, user_caption, target_user,
     found_status = OLD_TO_STATUS.get(found_stage, "Replied")
     found_next = str(info.get("next_steps", "Follow up with client")).strip()
     found_summary = str(info.get("summary", "Screenshot analyzed")).strip()
+    found_email = str(info.get("email", "")).strip().lower()
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", found_email):
+        found_email = ""
     if len(found_summary) > MAX_SUMMARY_CHARS:
         found_summary = found_summary[:MAX_SUMMARY_CHARS].rstrip() + "…"
 
@@ -1349,11 +1418,13 @@ def analyze_and_reply(status, image_bytes, user_caption, target_user,
     if existing:
         merged = f"{existing['note']} | {note}" if existing["note"] else note
         fields = {"note": merged[:2000]}
+        if found_email and not existing.get("email"):
+            fields["email"] = found_email
         if (existing["status"] or "Message Sent") == "Message Sent":
             fields["status"] = found_status
         lead = update_lead(found_user, **fields)
     else:
-        lead, _ = add_lead(full_name="", user_name=found_user,
+        lead, _ = add_lead(full_name="", email=found_email, user_name=found_user,
                            sender_name=setter, note=note, status=found_status)
 
     card = lead_card(lead) if lead else f"👤 <b>{esc(found_user)}</b> saved."
@@ -1451,7 +1522,7 @@ def on_menu(call):
     data = call.data
     if data == "menu:home":
         text = welcome_text(call.from_user.first_name or "there")
-        kb = main_menu_kb()
+        kb = main_menu_kb(sender_handle(call.message))
     elif data == "menu:leads":
         viewer = sender_handle(call.message)
         rows = my_leads_for(viewer)
@@ -1460,7 +1531,14 @@ def on_menu(call):
     elif data == "menu:stats":
         text = stats_text()
         kb = home_button_kb()
+    elif data == "menu:followups":
+        viewer = sender_handle(call.message)
+        text, btns = render_followups(my_leads_for(viewer))
+        kb = leads_kb(btns)
     elif data == "ask:add":
+        if followup_block_message(chat_id, sender_handle(call.message)):
+            bot.answer_callback_query(call.id)
+            return
         _pending_add[chat_id] = {"step": "username", "data": {}}
         _ask_add_step(chat_id, "username")
         bot.answer_callback_query(call.id)
@@ -1952,7 +2030,6 @@ def _start_health_server():
 if __name__ == "__main__":
     register_bot_commands()
     threading.Thread(target=_start_health_server, daemon=True).start()
-    threading.Thread(target=_reminder_loop, daemon=True).start()
     print("Gretta AI CRM Bot running (interactive build)...")
     while True:
         try:

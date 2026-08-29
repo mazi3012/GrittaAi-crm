@@ -70,7 +70,7 @@
 |---|---|
 | `user_name` | TEXT PK — normalized: trimmed, lowercased, leading `@` |
 | `lead_number` | auto-increments **per setter** (each member has their own tab numbering) |
-| `full_name` / `profile_link` / `followers_count` | identity columns; link is auto-built from the handle |
+| `full_name` / `email` / `profile_link` / `followers_count` | identity columns; link is auto-built from the handle |
 | `sender_name` / `sender_profile` | the setter who owns the lead (reassignable) |
 | `first_touchpoint` / `last_touchpoint` | date stamps; every write bumps Last Touchpoint |
 | `note` | free-text context, appended by `/note` and the AI analyzer |

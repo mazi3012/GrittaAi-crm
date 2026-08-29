@@ -162,7 +162,7 @@ def api_auth_logout(response: Response):
 
 
 def _lead_dicts():
-    """Full sheet-shaped rows for the SPA (all 27 columns + timestamps)."""
+    """Full sheet-shaped rows for the SPA (all 28 columns + timestamps)."""
     leads = []
     for row in all_leads():
         lead = dict(row)
@@ -242,6 +242,7 @@ class UpdateIn(BaseModel):
     username: str = Field(min_length=1, max_length=120)
     status: str | None = Field(default=None, max_length=40)
     full_name: str | None = Field(default=None, max_length=200)
+    email: str | None = Field(default=None, max_length=320)
     followers_count: str | None = Field(default=None, max_length=60)
     number: str | None = Field(default=None, max_length=60)
     note: str | None = Field(default=None, max_length=4000)
