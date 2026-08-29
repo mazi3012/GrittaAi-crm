@@ -84,6 +84,8 @@ from db import (  # noqa: E402  (after env validation)
     today_str,
     track_bot_user,
     update_lead,
+    next_followup_date,
+    overdue_leads_for_sender,
 )
 import sheets  # noqa: E402  Google Sheets mirror (no-op unless configured)
 
@@ -146,7 +148,7 @@ def _gate(tg_user, chat_id) -> bool:
     tid = str(getattr(tg_user, "id", "") or "")
     uname = f"@{getattr(tg_user, 'username', None)}" if getattr(tg_user, "username", None) else None
     try:
-        track_bot_user(tid, uname, getattr(tg_user, "first_name", None))
+        track_bot_user(tid, uname, getattr(tg_user, "first_name", None), chat_id=chat_id)
     except Exception as exc:
         print(f"bot_users tracking failed: {exc}")
     if OPEN_ACCESS:
@@ -766,6 +768,17 @@ def _process_add_step(message, state):
 def handle_addlead(message):
     """Guided lead creation: @username -> name -> followers -> note."""
     chat_id = message.chat.id
+    # Apply the same gate to both the one-line and guided /addlead flows.
+    blocked = overdue_leads_for_sender(sender_handle(message))
+    if blocked:
+        names = ", ".join(x["user_name"] for x in blocked[:8])
+        bot.send_message(
+            chat_id,
+            "⛔ <b>Follow-up required before adding a new lead.</b>\n\n"
+            f"Overdue: {esc(names)}\n"
+            "Complete it with <code>/fup @username 1</code> (or the next number), "
+            "then try again.", parse_mode="HTML")
+        return
     parts = (message.text or "").split(maxsplit=1)
     target = None
     if len(parts) > 1:
@@ -946,6 +959,14 @@ def handle_fup(message):
         return
     current = (get_lead(target) or {}).get("status", "")
     fields = {f"follow_up_{n}": "Yes"}
+    # Store the next scheduled touchpoint according to the BD sequence:
+    # Day 3, Day 6, Day 9, Day 13. The text is still copied by the setter;
+    # this command only records completion and schedules the next reminder.
+    current_lead = get_lead(target)
+    if current_lead and int(n) < 4:
+        fields["next_touchpoint"] = next_followup_date(current_lead, int(n) + 1)
+    elif int(n) == 4:
+        fields["next_touchpoint"] = ""
     if current in ("Message Sent", "Seen Not Replied", "Replied",
                    f"Follow up {n}") or not current:
         fields["status"] = f"Follow up {n}"
@@ -957,6 +978,57 @@ def handle_fup(message):
                      f"🔁 Follow up {n} marked done for {esc(target)} "
                      f"({today_str()}) → <b>{status_chip(lead['status'])}</b>",
                      parse_mode="HTML", reply_markup=home_button_kb())
+
+
+@bot.message_handler(commands=["reminders"])
+@member_only
+def handle_reminders(message):
+    """Show due follow-ups; used by the periodic notifier and teammates."""
+    owner = sender_handle(message)
+    due = overdue_leads_for_sender(owner)
+    if not due:
+        bot.send_message(message.chat.id, "✅ No overdue follow-ups.", reply_markup=home_button_kb())
+        return
+    lines = [f"🔔 <b>{len(due)} follow-up(s) due</b> for {esc(owner)}", ""]
+    for lead in due[:25]:
+        lines.append(
+            f"• <a href=\"{esc(lead['profile_link'])}\">{esc(lead['user_name'])}</a> "
+            f"— due {esc(lead['next_touchpoint'])} — <code>/fup {esc(lead['user_name'])} "
+            f"{min(int(lead.get('follow_up_1') == 'Yes') + int(lead.get('follow_up_2') == 'Yes') + int(lead.get('follow_up_3') == 'Yes') + int(lead.get('follow_up_4') == 'Yes') + 1, 4)}</code>"
+        )
+    bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML",
+                     disable_web_page_preview=True, reply_markup=home_button_kb())
+
+
+def send_due_followup_reminders():
+    """Send one daily reminder to each stored setter chat ID.
+
+    Telegram chat IDs are captured from real interactions, so no manual
+    mapping is needed for Mazidur Rahman or the existing team users.
+    """
+    for row in all_bot_users():
+        telegram_id, username, _first_name, authorized = row[:4]
+        if not authorized and not OPEN_ACCESS:
+            continue
+        owner = username or ""
+        due = overdue_leads_for_sender(owner)
+        if not due:
+            continue
+        try:
+            bot.send_message(telegram_id, f"🔔 You have {len(due)} overdue follow-up(s). Use /reminders to see them.")
+        except Exception as exc:
+            print(f"Reminder delivery failed for {telegram_id}: {exc}")
+
+
+def _reminder_loop():
+    """Run the notifier once per day without changing polling behavior."""
+    last_run = ""
+    while True:
+        today = today_str()
+        if today != last_run:
+            send_due_followup_reminders()
+            last_run = today
+        time.sleep(300)
 
 
 @bot.message_handler(commands=["next"])
@@ -1880,6 +1952,7 @@ def _start_health_server():
 if __name__ == "__main__":
     register_bot_commands()
     threading.Thread(target=_start_health_server, daemon=True).start()
+    threading.Thread(target=_reminder_loop, daemon=True).start()
     print("Gretta AI CRM Bot running (interactive build)...")
     while True:
         try:

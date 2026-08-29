@@ -24,7 +24,7 @@ untouched in `leads_legacy` so nothing is ever lost.
 import os
 import sqlite3
 import threading
-from datetime import date
+from datetime import date, timedelta
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 USE_PG = bool(DATABASE_URL)
@@ -118,6 +118,7 @@ _SCHEMA = (
     """
     CREATE TABLE IF NOT EXISTS bot_users (
         telegram_id TEXT PRIMARY KEY,
+        chat_id TEXT,
         username TEXT,
         first_name TEXT,
         is_authorized INTEGER DEFAULT 0,
@@ -198,10 +199,13 @@ def init_db():
                 conn.commit()
             for statement in _SCHEMA:
                 conn.execute(statement)
-            conn.commit()
+            # Additive migration: older installations only have telegram_id.
+            # Never alter or remove existing access/lead data.
+            if "chat_id" not in _table_columns(conn, "bot_users"):
+                conn.execute("ALTER TABLE bot_users ADD COLUMN chat_id TEXT")
             if legacy:
                 _import_legacy_rows(conn, legacy)
-                conn.commit()
+            conn.commit()
         finally:
             conn.close()
         _initialized = True
@@ -299,11 +303,58 @@ def add_lead(user_name, full_name="", sender_name="", followers_count="",
                  (note or "").strip(), status, today,
                  (number or "").strip(), number_received),
             )
+            # The first touch is Day 1; the first follow-up is due on Day 3.
+            conn.execute(
+                f"UPDATE leads SET next_touchpoint = {_PH} WHERE LOWER(user_name) = {_PH}",
+                ((date.today() + timedelta(days=2)).strftime("%Y-%m-%d"), uname),
+            )
             conn.commit()
     finally:
         conn.close()
     _notify_sheet(f"add_lead:{uname}")
     return get_lead(uname), True
+
+
+def overdue_leads_for_sender(sender_name, today=None):
+    """Return leads whose scheduled touchpoint is overdue for a setter.
+
+    A reply or terminal status ends the reminder/blocking lifecycle. The
+    helper is intentionally read-only so existing writes remain unchanged.
+    """
+    init_db()
+    sender = (sender_name or "").strip()
+    cutoff = today or today_str()
+    terminal = ("Replied-No yet booked", "Number received", "Closing Call",
+                "Discovery Call booked", "Not Interested", "Lost", "Won")
+    conn = _connect()
+    try:
+        cols = ", ".join(LEAD_FIELDS)
+        placeholders = ", ".join(_PH for _ in terminal)
+        cur = conn.execute(
+            f"SELECT {cols} FROM leads WHERE LOWER(sender_name) = LOWER({_PH}) "
+            f"AND next_touchpoint <> '' AND next_touchpoint <= {_PH} "
+            f"AND status NOT IN ({placeholders}) "
+            "AND COALESCE(replied, '') <> 'Yes' "
+            "ORDER BY next_touchpoint, lead_number",
+            (sender, cutoff, *terminal),
+        )
+        return [_row_to_dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def next_followup_date(lead, followup_number):
+    """Return the team schedule date for follow-up 1..4.
+
+    The supplied BD process uses Day 3, 6, 9 and 13. Dates are calculated
+    from the first touchpoint, with a safe fallback to today.
+    """
+    try:
+        start = date.fromisoformat(str(lead.get("first_touchpoint") or today_str()))
+        offsets = {1: 2, 2: 5, 3: 8, 4: 12}
+        return (start + timedelta(days=offsets[int(followup_number)])).strftime("%Y-%m-%d")
+    except (AttributeError, TypeError, ValueError, KeyError):
+        return ""
 
 
 def _apply_rules(fields):
@@ -513,7 +564,7 @@ def _norm_handle(value):
     return f"@{value.lstrip('@')}" if value else ""
 
 
-def track_bot_user(telegram_id, username=None, first_name=None):
+def track_bot_user(telegram_id, username=None, first_name=None, chat_id=None):
     """Upsert a Telegram user's presence: bump msg_count + last_seen."""
     tid = str(telegram_id or "").strip()
     if not tid:
@@ -527,29 +578,31 @@ def track_bot_user(telegram_id, username=None, first_name=None):
                 conn.execute(
                     """
                     INSERT INTO bot_users
-                        (telegram_id, username, first_name, msg_count,
+                        (telegram_id, chat_id, username, first_name, msg_count,
                          first_seen, last_seen)
-                    VALUES (%s, %s, %s, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    VALUES (%s, %s, %s, %s, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     ON CONFLICT (telegram_id) DO UPDATE SET
+                        chat_id = EXCLUDED.chat_id,
                         username = EXCLUDED.username,
                         first_name = EXCLUDED.first_name,
                         msg_count = bot_users.msg_count + 1,
                         last_seen = CURRENT_TIMESTAMP
                     """,
-                    (tid, handle or None, (first_name or "").strip() or None),
+                    (tid, str(chat_id or tid), handle or None, (first_name or "").strip() or None),
                 )
             else:
                 conn.execute(
-                    f"INSERT INTO bot_users (telegram_id, username, first_name,"
+                    f"INSERT INTO bot_users (telegram_id, chat_id, username, first_name,"
                     f" msg_count, first_seen, last_seen) "
-                    f"VALUES ({_PH}, {_PH}, {_PH}, 1, CURRENT_TIMESTAMP, "
+                    f"VALUES ({_PH}, {_PH}, {_PH}, {_PH}, 1, CURRENT_TIMESTAMP, "
                     f"CURRENT_TIMESTAMP) "
                     f"ON CONFLICT(telegram_id) DO UPDATE SET "
+                    f"chat_id = excluded.chat_id, "
                     f"username = excluded.username, "
                     f"first_name = excluded.first_name, "
                     f"msg_count = msg_count + 1, "
                     f"last_seen = CURRENT_TIMESTAMP",
-                    (tid, handle or None, (first_name or "").strip() or None),
+                    (tid, str(chat_id or tid), handle or None, (first_name or "").strip() or None),
                 )
             conn.commit()
     finally:
@@ -561,6 +614,8 @@ def all_bot_users():
 
     Rows are tuples of (telegram_id, username, first_name, is_authorized,
     msg_count, first_seen, last_seen) with timestamps normalized to strings.
+    The stored chat_id is currently kept internal because Telegram private
+    chats use the user's stable numeric ID.
     """
     init_db()
     conn = _connect()
