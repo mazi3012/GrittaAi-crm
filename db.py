@@ -186,6 +186,52 @@ def _row_to_dict(row):
     return lead
 
 
+def next_unfinished_followup(lead):
+    """Return the first incomplete follow-up number, or ``None``."""
+    for number in (1, 2, 3, 4):
+        if str(lead.get(f"follow_up_{number}") or "") != "Yes":
+            return number
+    return None
+
+
+def next_followup_date(lead, followup_number):
+    """Return the scheduled date for follow-up 1..4.
+
+    The schedule is anchored to the lead's first touchpoint.  The team
+    sequence is Day 3, Day 6, Day 9 and Day 13, represented as literal day
+    offsets from that anchor.
+    """
+    try:
+        start = date.fromisoformat(str(lead.get("first_touchpoint") or ""))
+        offsets = {1: 3, 2: 6, 3: 9, 4: 13}
+        return (start + timedelta(days=offsets[int(followup_number)])).strftime("%Y-%m-%d")
+    except (AttributeError, TypeError, ValueError, KeyError):
+        return ""
+
+
+def scheduled_next_followup(lead):
+    """Return ``(stage, date)`` for the first unfinished stage."""
+    stage = next_unfinished_followup(lead)
+    return stage, next_followup_date(lead, stage) if stage else ""
+
+
+def _backfill_followup_dates(conn):
+    """Fill missing next-touchpoint dates without changing legacy flags."""
+    cols = ", ".join(LEAD_FIELDS)
+    cur = conn.execute(f"SELECT {cols} FROM leads")
+    for row in cur.fetchall():
+        lead = _row_to_dict(row)
+        if lead.get("next_touchpoint"):
+            continue
+        _, scheduled = scheduled_next_followup(lead)
+        if scheduled:
+            conn.execute(
+                f"UPDATE leads SET next_touchpoint = {_PH} "
+                f"WHERE LOWER(user_name) = {_PH}",
+                (scheduled, lead["user_name"]),
+            )
+
+
 def init_db():
     """Create the schema once per process; migrate legacy data if found."""
     global _initialized
@@ -208,6 +254,7 @@ def init_db():
                 conn.execute("ALTER TABLE leads ADD COLUMN email TEXT DEFAULT ''")
             if legacy:
                 _import_legacy_rows(conn, legacy)
+            _backfill_followup_dates(conn)
             conn.commit()
         finally:
             conn.close()
@@ -306,10 +353,10 @@ def add_lead(user_name, full_name="", email="", sender_name="", followers_count=
                  (note or "").strip(), status, today,
                  (number or "").strip(), number_received),
             )
-            # The first touch is Day 1; the first follow-up is due on Day 3.
+            # Schedule the first follow-up from the lead creation/first-touch date.
             conn.execute(
                 f"UPDATE leads SET next_touchpoint = {_PH} WHERE LOWER(user_name) = {_PH}",
-                ((date.today() + timedelta(days=2)).strftime("%Y-%m-%d"), uname),
+                ((date.today() + timedelta(days=3)).strftime("%Y-%m-%d"), uname),
             )
             conn.commit()
     finally:
@@ -348,20 +395,6 @@ def overdue_leads_for_sender(sender_name, today=None):
         return [_row_to_dict(row) for row in cur.fetchall()]
     finally:
         conn.close()
-
-
-def next_followup_date(lead, followup_number):
-    """Return the team schedule date for follow-up 1..4.
-
-    The supplied BD process uses Day 3, 6, 9 and 13. Dates are calculated
-    from the first touchpoint, with a safe fallback to today.
-    """
-    try:
-        start = date.fromisoformat(str(lead.get("first_touchpoint") or today_str()))
-        offsets = {1: 2, 2: 5, 3: 8, 4: 12}
-        return (start + timedelta(days=offsets[int(followup_number)])).strftime("%Y-%m-%d")
-    except (AttributeError, TypeError, ValueError, KeyError):
-        return ""
 
 
 def _apply_rules(fields):
@@ -417,6 +450,14 @@ def update_lead(user_name, **fields):
     if not clean:
         return get_lead(uname)
     _apply_rules(clean)
+    current = get_lead(uname)
+    if current is None:
+        return None
+    prospective = dict(current)
+    prospective.update(clean)
+    if any(clean.get(f"follow_up_{n}") == "Yes" for n in (1, 2, 3, 4)) \
+            and "next_touchpoint" not in clean:
+        _, clean["next_touchpoint"] = scheduled_next_followup(prospective)
     clean.setdefault("last_touchpoint", today_str())
     assignments = ", ".join(f"{k} = {_PH}" for k in clean)
     conn = _connect()
@@ -428,8 +469,6 @@ def update_lead(user_name, **fields):
                 f"WHERE LOWER(user_name) = {_PH}",
                 tuple(clean.values()) + (uname,),
             )
-            if cur.rowcount == 0:
-                return None
             conn.commit()
     finally:
         conn.close()
@@ -457,6 +496,8 @@ def upsert_lead(fields):
         data.setdefault("status", "Message Sent")
         data.setdefault("first_touchpoint", today)
         data.setdefault("last_touchpoint", today)
+        if not data.get("next_touchpoint"):
+            _, data["next_touchpoint"] = scheduled_next_followup(data)
         conn = _connect()
         try:
             with _write_lock:

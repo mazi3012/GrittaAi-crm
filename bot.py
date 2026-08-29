@@ -81,6 +81,7 @@ from db import (  # noqa: E402  (after env validation)
     normalize_username,
     overdue_leads_for_sender,
     profile_link_for,
+    scheduled_next_followup,
     set_bot_user_authorized,
     today_str,
     track_bot_user,
@@ -711,34 +712,52 @@ def render_my_leads(rows):
 
 
 def render_followups(rows):
-    """Show only unfinished follow-ups with tappable lead cards."""
+    """Show pending follow-ups grouped by stage with tappable lead cards."""
     header = "🔁 <b>My Follow-ups</b>\n\n"
     today = today_str()
-    pending_rows = []
-    buttons = []
+    grouped = {stage: [] for stage in (1, 2, 3, 4)}
+
     for lead in rows:
         next_n = next((i for i in (1, 2, 3, 4)
                        if lead[f"follow_up_{i}"] != "Yes"), None)
         if next_n is not None:
-            pending_rows.append((lead, next_n))
+            when = lead.get("next_touchpoint") or ""
+            due = bool(when and when <= today)
+            grouped[next_n].append((lead, due, when))
 
+    pending_rows = [item for stage in grouped.values() for item in stage]
     if not pending_rows:
         return header + "✅ You have no pending follow-ups.", []
 
-    lines = [f"Pending follow-ups: <b>{len(pending_rows)}</b>", ""]
-    for lead, next_n in pending_rows:
-        username = lead["user_name"]
-        name = lead["full_name"] or username
-        when = lead.get("next_touchpoint") or "not scheduled"
-        due = bool(lead.get("next_touchpoint") and lead["next_touchpoint"] <= today)
-        marker = "🔔" if due else "📅"
-        lines.append(f"{marker} <b>FU{next_n}</b> · {esc(name)} "
-                     f"{esc(username)} — {esc(when)}")
-        cb = f"lead:{username}"
-        if len(cb.encode()) <= 64:
-            buttons.append(types.InlineKeyboardButton(
-                f"FU{next_n} · {username}", callback_data=cb))
-    return header + "\n".join(lines), buttons
+    due_count = sum(1 for _, due, _ in pending_rows if due)
+    unscheduled_count = sum(1 for _, _, when in pending_rows if not when)
+    summary = [f"Pending: <b>{len(pending_rows)}</b>"]
+    if due_count:
+        summary.append(f"🔔 Due: <b>{due_count}</b>")
+    if unscheduled_count:
+        summary.append(f"🗓 Unscheduled: <b>{unscheduled_count}</b>")
+
+    stage_names = {1: "First", 2: "Second", 3: "Third", 4: "Fourth"}
+    lines = [" · ".join(summary), ""]
+    buttons = []
+    for stage, stage_rows in grouped.items():
+        if not stage_rows:
+            continue
+        stage_rows.sort(key=lambda item: (not item[1], not bool(item[2]), item[2] or ""))
+        lines.append(f"<b>FU{stage} · {stage_names[stage]} follow-up</b> ({len(stage_rows)})")
+        for lead, due, when in stage_rows:
+            username = lead["user_name"]
+            name = lead["full_name"] or username
+            marker = "🔔" if due else ("📅" if when else "🗓")
+            lines.append(
+                f"{marker} <b>{esc(name)}</b> {esc(username)} — "
+                f"{esc(when or 'not scheduled')}"
+            )
+            cb = f"lead:{username}"
+            if len(cb.encode()) <= 64:
+                buttons.append(types.InlineKeyboardButton(username, callback_data=cb))
+        lines.append("")
+    return header + "\n".join(lines).rstrip(), buttons
 
 
 def leads_kb(buttons):
@@ -1048,16 +1067,20 @@ def handle_fup(message):
                          "Usage: <code>/fup @user 2</code>  (1-4)",
                          parse_mode="HTML")
         return
-    current = (get_lead(target) or {}).get("status", "")
+    current_lead = get_lead(target)
+    if not current_lead:
+        show_lead_record(message.chat.id, target)
+        return
+    current = current_lead.get("status", "")
     fields = {f"follow_up_{n}": "Yes"}
     # Store the next scheduled touchpoint according to the BD sequence:
     # Day 3, Day 6, Day 9, Day 13. The text is still copied by the setter;
     # this command only records completion and schedules the next reminder.
-    current_lead = get_lead(target)
-    if current_lead and int(n) < 4:
-        fields["next_touchpoint"] = next_followup_date(current_lead, int(n) + 1)
-    elif int(n) == 4:
-        fields["next_touchpoint"] = ""
+    # Recalculate from the first unfinished stage so legacy rows with skipped
+    # or inconsistent flags recover safely instead of showing a stale date.
+    prospective = dict(current_lead)
+    prospective[f"follow_up_{n}"] = "Yes"
+    _, fields["next_touchpoint"] = scheduled_next_followup(prospective)
     if current in ("Message Sent", "Seen Not Replied", "Replied",
                    f"Follow up {n}") or not current:
         fields["status"] = f"Follow up {n}"
