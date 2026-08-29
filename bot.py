@@ -755,6 +755,10 @@ def render_followups(rows):
                        if lead[f"follow_up_{i}"] != "Yes"), None)
         if next_n is not None:
             when = lead.get("next_touchpoint") or ""
+            # Keep future follow-ups hidden until their scheduled day. This
+            # leaves the list focused on the leads that can be actioned now.
+            if when and when > today:
+                continue
             due = bool(when and when <= today)
             grouped[next_n].append((lead, due, when))
 
