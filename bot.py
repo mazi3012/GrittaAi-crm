@@ -711,57 +711,34 @@ def render_my_leads(rows):
 
 
 def render_followups(rows):
-    """Show a setter's follow-up workload with tappable lead cards."""
+    """Show only unfinished follow-ups with tappable lead cards."""
     header = "🔁 <b>My Follow-ups</b>\n\n"
-    if not rows:
-        return header + "You don't have any assigned leads yet.", []
-
     today = today_str()
-    groups = []
+    pending_rows = []
     buttons = []
-    total_pending = 0
-    total_due = 0
-    for n in (1, 2, 3, 4):
-        # Each lead belongs to its next unfinished follow-up, not to every
-        # later stage in the sequence.
-        pending = []
-        for lead in rows:
-            next_n = next((i for i in (1, 2, 3, 4)
-                           if lead[f"follow_up_{i}"] != "Yes"), None)
-            if next_n == n:
-                pending.append(lead)
-        if not pending:
-            continue
-        due = [lead for lead in pending
-               if lead.get("next_touchpoint") and lead["next_touchpoint"] <= today]
-        upcoming = [lead for lead in pending if lead not in due]
-        total_pending += len(pending)
-        total_due += len(due)
-        groups.append(f"<b>Follow-up {n}</b>: {len(pending)} pending · "
-                      f"{len(due)} due · {len(upcoming)} upcoming")
-        for lead in due + upcoming:
-            username = lead["user_name"]
-            name = lead["full_name"] or username
-            when = lead.get("next_touchpoint") or "not scheduled"
-            marker = "🔔" if lead in due else "📅"
-            groups.append(f"  {marker} {esc(name)} {esc(username)} — {esc(when)}")
-            cb = f"lead:{username}"
-            if len(cb.encode()) <= 64:
-                buttons.append(types.InlineKeyboardButton(
-                    f"FU{n} · {username}", callback_data=cb))
+    for lead in rows:
+        next_n = next((i for i in (1, 2, 3, 4)
+                       if lead[f"follow_up_{i}"] != "Yes"), None)
+        if next_n is not None:
+            pending_rows.append((lead, next_n))
 
-    completed = sum(
-        1 for lead in rows for n in (1, 2, 3, 4)
-        if lead[f"follow_up_{n}"] == "Yes"
-    )
-    if not groups:
-        text = header + f"✅ All follow-ups completed for your {len(rows)} leads."
-    else:
-        text = (header + f"Assigned leads: <b>{len(rows)}</b> · "
-                f"Pending follow-ups: <b>{total_pending}</b> · "
-                f"Due now: <b>{total_due}</b> · Completed: <b>{completed}</b>\n\n" +
-                "\n".join(groups))
-    return text, buttons
+    if not pending_rows:
+        return header + "✅ You have no pending follow-ups.", []
+
+    lines = [f"Pending follow-ups: <b>{len(pending_rows)}</b>", ""]
+    for lead, next_n in pending_rows:
+        username = lead["user_name"]
+        name = lead["full_name"] or username
+        when = lead.get("next_touchpoint") or "not scheduled"
+        due = bool(lead.get("next_touchpoint") and lead["next_touchpoint"] <= today)
+        marker = "🔔" if due else "📅"
+        lines.append(f"{marker} <b>FU{next_n}</b> · {esc(name)} "
+                     f"{esc(username)} — {esc(when)}")
+        cb = f"lead:{username}"
+        if len(cb.encode()) <= 64:
+            buttons.append(types.InlineKeyboardButton(
+                f"FU{next_n} · {username}", callback_data=cb))
+    return header + "\n".join(lines), buttons
 
 
 def leads_kb(buttons):
@@ -773,12 +750,8 @@ def leads_kb(buttons):
 
 
 def followup_block_message(chat_id, viewer):
-    """Prevent new lead creation while this setter has an unfinished follow-up."""
-    terminal = {"Replied-No yet booked", "Number received", "Closing Call",
-                "Discovery Call booked", "Not Interested", "Lost", "Won"}
-    blocked = [lead for lead in my_leads_for(viewer)
-               if lead.get("status") not in terminal and
-               any(lead[f"follow_up_{n}"] != "Yes" for n in (1, 2, 3, 4))]
+    """Prevent new lead creation only while a follow-up is due or overdue."""
+    blocked = overdue_leads_for_sender(viewer)
     if not blocked:
         return False
     names = ", ".join(x["user_name"] for x in blocked[:8])
@@ -1635,6 +1608,7 @@ def on_lead_action(call):
         return
     chat_id = call.message.chat.id
     lead = None
+    viewer = callback_sender_handle(call)
     if action == "replied":
         current = (get_lead(username) or {}).get("status", "")
         fields = {"replied": "Yes"}

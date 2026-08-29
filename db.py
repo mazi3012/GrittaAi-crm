@@ -337,6 +337,10 @@ def overdue_leads_for_sender(sender_name, today=None):
             f"SELECT {cols} FROM leads WHERE LOWER(sender_name) = LOWER({_PH}) "
             f"AND next_touchpoint <> '' AND next_touchpoint <= {_PH} "
             f"AND status NOT IN ({placeholders}) "
+            "AND (COALESCE(follow_up_1, '') <> 'Yes' "
+            "OR COALESCE(follow_up_2, '') <> 'Yes' "
+            "OR COALESCE(follow_up_3, '') <> 'Yes' "
+            "OR COALESCE(follow_up_4, '') <> 'Yes') "
             "AND COALESCE(replied, '') <> 'Yes' "
             "ORDER BY next_touchpoint, lead_number",
             (sender, cutoff, *terminal),
