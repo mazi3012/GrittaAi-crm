@@ -250,6 +250,10 @@ def main_menu_kb(viewer=None):
     followup_label = "🔁 Follow-ups"
     if viewer:
         pending = overdue_leads_for_sender(viewer)
+        if pending:
+            # Telegram does not support custom inline-button colors. The
+            # yellow marker provides a clear due/overdue visual indicator.
+            followup_label = "🟡 Follow-ups"
         due_stages = {}
         for lead in pending:
             stage = next((n for n in (1, 2, 3, 4)
@@ -1769,7 +1773,16 @@ def on_followup_done(call):
     if expected != stage:
         bot.answer_callback_query(call.id, "That follow-up is no longer pending.", show_alert=True)
         return
-    lead = update_lead(username, **{f"follow_up_{stage}": "Yes"})
+    # Advance the schedule when this card is completed. Without explicitly
+    # replacing next_touchpoint, FU2 would inherit FU1's already-due date and
+    # appear immediately instead of waiting until its scheduled day.
+    prospective = dict(lead)
+    prospective[f"follow_up_{stage}"] = "Yes"
+    _, next_touchpoint = scheduled_next_followup(prospective)
+    lead = update_lead(
+        username,
+        **{f"follow_up_{stage}": "Yes", "next_touchpoint": next_touchpoint},
+    )
     refresh_followup_cards(call)
     bot.answer_callback_query(call.id, f"✅ FU{stage} completed")
 
