@@ -712,12 +712,15 @@ def render_my_leads(rows):
 
 
 def render_followups(rows):
-    """Show pending follow-ups grouped by stage with tappable lead cards."""
+    """Show pending follow-ups as grouped, actionable lead cards."""
     header = "🔁 <b>My Follow-ups</b>\n\n"
     today = today_str()
     grouped = {stage: [] for stage in (1, 2, 3, 4)}
+    terminal = {"Not Interested", "Lost", "Won"}
 
     for lead in rows:
+        if lead.get("status") in terminal:
+            continue
         next_n = next((i for i in (1, 2, 3, 4)
                        if lead[f"follow_up_{i}"] != "Yes"), None)
         if next_n is not None:
@@ -748,14 +751,21 @@ def render_followups(rows):
         for lead, due, when in stage_rows:
             username = lead["user_name"]
             name = lead["full_name"] or username
+            profile = lead.get("profile_link") or profile_link_for(username)
             marker = "🔔" if due else ("📅" if when else "🗓")
             lines.append(
-                f"{marker} <b>{esc(name)}</b> {esc(username)} — "
-                f"{esc(when or 'not scheduled')}"
+                f"<b>┌ {esc(name)}</b> {esc(username)}\n"
+                f"{marker} FU{stage} · {esc(when or 'not scheduled')}\n"
+                f"🔗 <a href=\"{esc(profile)}\">Open Instagram profile</a>\n"
+                "└────────────────"
             )
-            cb = f"lead:{username}"
-            if len(cb.encode()) <= 64:
-                buttons.append(types.InlineKeyboardButton(username, callback_data=cb))
+            buttons.extend([
+                types.InlineKeyboardButton("↗ Profile", url=profile),
+                types.InlineKeyboardButton(
+                    f"✅ Done FU{stage}", callback_data=f"fu_done:{username}:{stage}"),
+                types.InlineKeyboardButton(
+                    "❌ End follow-up", callback_data=f"fu_end:{username}"),
+            ])
         lines.append("")
     return header + "\n".join(lines).rstrip(), buttons
 
@@ -1706,6 +1716,57 @@ def on_lead_action(call):
     except Exception:
         pass
     bot.answer_callback_query(call.id, toast[:190])
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("fu_done:"))
+@member_callback
+def on_followup_done(call):
+    """Mark the displayed follow-up complete and refresh the list."""
+    try:
+        _, username, stage_text = call.data.split(":", 2)
+        stage = int(stage_text)
+        if stage not in (1, 2, 3, 4):
+            raise ValueError
+    except ValueError:
+        bot.answer_callback_query(call.id, "Invalid follow-up.", show_alert=True)
+        return
+    lead = get_lead(username)
+    if not lead:
+        bot.answer_callback_query(call.id, "Lead no longer exists.", show_alert=True)
+        return
+    expected = next((n for n in (1, 2, 3, 4)
+                     if lead[f"follow_up_{n}"] != "Yes"), None)
+    if expected != stage:
+        bot.answer_callback_query(call.id, "That follow-up is no longer pending.", show_alert=True)
+        return
+    lead = update_lead(username, **{f"follow_up_{stage}": "Yes"})
+    viewer = callback_sender_handle(call)
+    text, buttons = render_followups(my_leads_for(viewer))
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                              parse_mode="HTML", reply_markup=leads_kb(buttons))
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id, f"✅ FU{stage} completed")
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("fu_end:"))
+@member_callback
+def on_followup_end(call):
+    """End the follow-up sequence by marking the lead Not Interested."""
+    username = call.data[len("fu_end:"):]
+    lead = update_lead(username, status="Not Interested", next_touchpoint="")
+    if not lead:
+        bot.answer_callback_query(call.id, "Lead no longer exists.", show_alert=True)
+        return
+    viewer = callback_sender_handle(call)
+    text, buttons = render_followups(my_leads_for(viewer))
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                              parse_mode="HTML", reply_markup=leads_kb(buttons))
+    except Exception:
+        pass
+    bot.answer_callback_query(call.id, "❌ Follow-up ended — marked Not Interested")
 
 
 # ------------------------------------------------------- screenshot actions
