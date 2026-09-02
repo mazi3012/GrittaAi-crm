@@ -775,8 +775,18 @@ def followup_stage_keyboard(rows):
     return kb
 
 
-def render_followups(rows, selected_stage=None):
-    """Return a stage selector and cards for one due follow-up stage."""
+FOLLOWUP_PAGE_SIZE = 10
+
+
+def followup_more_keyboard(keyboard, stage, next_page):
+    """Add pagination to the final card in a follow-up page."""
+    keyboard.add(types.InlineKeyboardButton(
+        "▶️ View more", callback_data=f"fumore:{stage}:{next_page}"))
+    return keyboard
+
+
+def render_followups(rows, selected_stage=None, page=0):
+    """Return the stage selector and one page of follow-up cards."""
     header = "🔁 <b>My Follow-ups</b>\n\n"
     if selected_stage is None:
         return [(header + "Choose a follow-up stage to view due leads.",
@@ -806,18 +816,24 @@ def render_followups(rows, selected_stage=None):
                  followup_stage_keyboard(rows))]
 
     due_count = sum(1 for _, due, _ in pending_rows if due)
+    pending_rows.sort(key=lambda item: (not item[1], not bool(item[2]), item[2] or ""))
+    start = page * FOLLOWUP_PAGE_SIZE
+    page_rows = pending_rows[start:start + FOLLOWUP_PAGE_SIZE]
+    has_more = start + FOLLOWUP_PAGE_SIZE < len(pending_rows)
     summary = [f"Pending: <b>{len(pending_rows)}</b>"]
     if due_count:
         summary.append(f"🔔 Due: <b>{due_count}</b>")
+    summary.append(
+        f"Showing <b>{start + 1}–{start + len(page_rows)}</b>")
 
     cards = [(header + f"<b>Follow-up {selected_stage}</b> · "
               + " · ".join(summary), followup_stage_keyboard(rows))]
-    for stage, stage_rows in grouped.items():
-        if not stage_rows:
-            continue
-        stage_rows.sort(key=lambda item: (not item[1], not bool(item[2]), item[2] or ""))
-        for lead, due, when in stage_rows:
-            cards.append(render_followup_card(lead, stage, due, when))
+    for lead, due, when in page_rows:
+        cards.append(render_followup_card(lead, selected_stage, due, when))
+    if has_more:
+        text, keyboard = cards[-1]
+        cards[-1] = (text, followup_more_keyboard(
+            keyboard, selected_stage, page + 1))
     return cards
 
 
@@ -830,7 +846,7 @@ def leads_kb(buttons):
 
 
 def send_followup_cards(chat_id, viewer):
-    """Send the follow-up summary and one message per lead card."""
+    """Send the follow-up summary and the first page of lead cards."""
     for text, keyboard in render_followups(my_leads_for(viewer)):
         bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=keyboard)
 
@@ -1672,6 +1688,26 @@ def on_followup_stage(call):
         if "message is not modified" not in str(exc).lower():
             bot.send_message(chat_id, cards[0][0], parse_mode="HTML",
                              reply_markup=cards[0][1])
+    bot.answer_callback_query(call.id)
+    for card_text, card_kb in cards[1:]:
+        bot.send_message(chat_id, card_text, parse_mode="HTML", reply_markup=card_kb)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("fumore:"))
+@member_callback
+def on_followup_more(call):
+    """Show the next ten leads in the selected follow-up stage."""
+    try:
+        _, stage_text, page_text = call.data.split(":", 2)
+        stage, page = int(stage_text), int(page_text)
+        if stage not in (1, 2, 3, 4) or page < 1:
+            raise ValueError
+    except ValueError:
+        bot.answer_callback_query(call.id, "Invalid follow-up page.", show_alert=True)
+        return
+    viewer = callback_sender_handle(call)
+    cards = render_followups(my_leads_for(viewer), selected_stage=stage, page=page)
+    chat_id = call.message.chat.id
     bot.answer_callback_query(call.id)
     for card_text, card_kb in cards[1:]:
         bot.send_message(chat_id, card_text, parse_mode="HTML", reply_markup=card_kb)
