@@ -216,20 +216,21 @@ def scheduled_next_followup(lead):
 
 
 def _backfill_followup_dates(conn):
-    """Recover missing dates only for records already in a FU sequence.
+    """Schedule the next unfinished follow-up for every contacted lead.
 
-    A completely untouched lead must not receive a scheduled follow-up merely
-    because it has a first-touch date. New leads are scheduled explicitly by
-    ``add_lead``; this guard also makes it safe to clear old test data.
+    The BD sequence is anchored to ``first_touchpoint``: FU1 is Day 3, FU2
+    Day 6, FU3 Day 9 and FU4 Day 13. This also repairs older/imported leads
+    whose follow-up flags were cleared or whose next date was missing.
     """
     cols = ", ".join(LEAD_FIELDS)
     cur = conn.execute(f"SELECT {cols} FROM leads")
     for row in cur.fetchall():
         lead = _row_to_dict(row)
-        if lead.get("next_touchpoint"):
+        if lead.get("status") in {"Not Interested", "Lost", "Won"}:
             continue
-        if not any(str(lead.get(f"follow_up_{n}") or "").strip()
-                   for n in (1, 2, 3, 4)):
+        # Preserve a manually selected next touchpoint. Only fill dates that
+        # are absent, such as after importing or resetting follow-up flags.
+        if lead.get("next_touchpoint"):
             continue
         _, scheduled = scheduled_next_followup(lead)
         if scheduled:
