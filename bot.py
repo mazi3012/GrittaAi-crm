@@ -38,7 +38,10 @@ from datetime import date, timedelta
 import requests
 import telebot
 from dotenv import load_dotenv
-from groq import Groq
+try:
+    from groq import Groq
+except ImportError:
+    Groq = None
 from PIL import Image
 from telebot import types
 
@@ -414,7 +417,7 @@ try:
 except Exception:
     pass
 
-groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+groq_client = Groq(api_key=GROQ_API_KEY) if (GROQ_API_KEY and Groq) else None
 
 
 def prepare_image_b64(image_bytes, max_dim=MAX_IMAGE_DIM):
@@ -755,8 +758,10 @@ def followup_stage_keyboard(rows):
         if lead.get("status") in terminal:
             continue
         stage = next_unfinished_followup(lead)
-        when = lead.get("next_touchpoint") or ""
-        if stage and (not when or when <= today):
+        if not stage:
+            continue
+        when = lead.get("next_touchpoint") or next_followup_date(lead, stage)
+        if when and when <= today:
             counts[stage] += 1
 
     kb = types.InlineKeyboardMarkup(row_width=2)
@@ -801,7 +806,7 @@ def render_followups(rows, selected_stage=None, page=0):
         next_n = next((i for i in (1, 2, 3, 4)
                        if lead[f"follow_up_{i}"] != "Yes"), None)
         if next_n is not None and next_n == selected_stage:
-            when = lead.get("next_touchpoint") or ""
+            when = lead.get("next_touchpoint") or next_followup_date(lead, next_n)
             # Keep future follow-ups hidden until their scheduled day. This
             # leaves the list focused on the leads that can be actioned now.
             if not when or when > today:
@@ -1164,14 +1169,9 @@ def handle_fup(message):
         show_lead_record(message.chat.id, target)
         return
     current = current_lead.get("status", "")
-    fields = {f"follow_up_{n}": "Yes"}
-    # Store the next scheduled touchpoint according to the BD sequence:
-    # Day 3, Day 6, Day 9, Day 13. The text is still copied by the setter;
-    # this command only records completion and schedules the next reminder.
-    # Recalculate from the first unfinished stage so legacy rows with skipped
-    # or inconsistent flags recover safely instead of showing a stale date.
+    fields = {f"follow_up_{n}": "Yes", f"follow_up_{n}_date": today_str()}
     prospective = dict(current_lead)
-    prospective[f"follow_up_{n}"] = "Yes"
+    prospective.update(fields)
     _, fields["next_touchpoint"] = scheduled_next_followup(prospective)
     if current in ("Message Sent", "Seen Not Replied", "Replied",
                    f"Follow up {n}") or not current:
@@ -1782,7 +1782,10 @@ def on_lead_action(call):
     elif action.startswith("fup") and action[-1] in "1234":
         n = action[-1]
         current = (get_lead(username) or {}).get("status", "")
-        fields = {f"follow_up_{n}": "Yes"}
+        fields = {f"follow_up_{n}": "Yes", f"follow_up_{n}_date": today_str()}
+        prospective = dict(get_lead(username) or {})
+        prospective.update(fields)
+        _, fields["next_touchpoint"] = scheduled_next_followup(prospective)
         if current in ("Message Sent", "Seen Not Replied", "Replied",
                        f"Follow up {n}", ""):
             fields["status"] = f"Follow up {n}"
@@ -1874,10 +1877,21 @@ def on_followup_done(call):
     # appear immediately instead of waiting until its scheduled day.
     prospective = dict(lead)
     prospective[f"follow_up_{stage}"] = "Yes"
+    prospective[f"follow_up_{stage}_date"] = today_str()
     _, next_touchpoint = scheduled_next_followup(prospective)
+    status_update = (
+        f"Follow up {stage}"
+        if lead.get("status") in ("Message Sent", "Seen Not Replied", "Replied", f"Follow up {stage}", "")
+        else lead.get("status")
+    )
     lead = update_lead(
         username,
-        **{f"follow_up_{stage}": "Yes", "next_touchpoint": next_touchpoint},
+        **{
+            f"follow_up_{stage}": "Yes",
+            f"follow_up_{stage}_date": today_str(),
+            "next_touchpoint": next_touchpoint,
+            "status": status_update,
+        },
     )
     # Replace the completed card with a freshly counted stage menu. This
     # immediately removes the completed stage from its button count (and the

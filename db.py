@@ -197,14 +197,26 @@ def next_unfinished_followup(lead):
 def next_followup_date(lead, followup_number):
     """Return the scheduled date for follow-up 1..4.
 
-    The schedule is anchored to the lead's first touchpoint.  The team
-    sequence is Day 3, Day 6, Day 9 and Day 13, represented as literal day
-    offsets from that anchor.
+    Each follow-up stage is scheduled 3 days after the previous touchpoint:
+    - FU1: 3 days after first_touchpoint (or lead creation).
+    - FU2: 3 days after follow_up_1_date is completed.
+    - FU3: 3 days after follow_up_2_date is completed.
+    - FU4: 3 days after follow_up_3_date is completed.
     """
     try:
-        start = date.fromisoformat(str(lead.get("first_touchpoint") or ""))
-        offsets = {1: 3, 2: 6, 3: 9, 4: 13}
-        return (start + timedelta(days=offsets[int(followup_number)])).strftime("%Y-%m-%d")
+        fn = int(followup_number)
+        if fn == 1:
+            base_str = lead.get("first_touchpoint") or today_str()
+        elif fn == 2:
+            base_str = lead.get("follow_up_1_date") or lead.get("last_touchpoint") or lead.get("first_touchpoint") or today_str()
+        elif fn == 3:
+            base_str = lead.get("follow_up_2_date") or lead.get("last_touchpoint") or lead.get("first_touchpoint") or today_str()
+        elif fn == 4:
+            base_str = lead.get("follow_up_3_date") or lead.get("last_touchpoint") or lead.get("first_touchpoint") or today_str()
+        else:
+            return ""
+        start = date.fromisoformat(str(base_str)[:10])
+        return (start + timedelta(days=3)).strftime("%Y-%m-%d")
     except (AttributeError, TypeError, ValueError, KeyError):
         return ""
 
@@ -212,15 +224,17 @@ def next_followup_date(lead, followup_number):
 def scheduled_next_followup(lead):
     """Return ``(stage, date)`` for the first unfinished stage."""
     stage = next_unfinished_followup(lead)
-    return stage, next_followup_date(lead, stage) if stage else ""
+    if not stage:
+        return None, ""
+    return stage, next_followup_date(lead, stage)
 
 
 def _backfill_followup_dates(conn):
     """Schedule the next unfinished follow-up for every contacted lead.
 
-    The BD sequence is anchored to ``first_touchpoint``: FU1 is Day 3, FU2
-    Day 6, FU3 Day 9 and FU4 Day 13. This also repairs older/imported leads
-    whose follow-up flags were cleared or whose next date was missing.
+    Each follow-up stage is due 3 days after the previous touchpoint.
+    This also repairs older/imported leads whose follow-up flags were cleared
+    or whose next date was missing or stale.
     """
     cols = ", ".join(LEAD_FIELDS)
     cur = conn.execute(f"SELECT {cols} FROM leads")
@@ -228,17 +242,32 @@ def _backfill_followup_dates(conn):
         lead = _row_to_dict(row)
         if lead.get("status") in {"Not Interested", "Lost", "Won"}:
             continue
-        # Preserve a manually selected next touchpoint. Only fill dates that
-        # are absent, such as after importing or resetting follow-up flags.
-        if lead.get("next_touchpoint"):
+        stage, scheduled = scheduled_next_followup(lead)
+        if not stage:
+            if lead.get("next_touchpoint"):
+                conn.execute(
+                    f"UPDATE leads SET next_touchpoint = '' "
+                    f"WHERE LOWER(user_name) = {_PH}",
+                    (lead["user_name"],),
+                )
             continue
-        _, scheduled = scheduled_next_followup(lead)
-        if scheduled:
-            conn.execute(
-                f"UPDATE leads SET next_touchpoint = {_PH} "
-                f"WHERE LOWER(user_name) = {_PH}",
-                (scheduled, lead["user_name"]),
-            )
+
+        last_done_date = ""
+        if stage == 2:
+            last_done_date = lead.get("follow_up_1_date") or ""
+        elif stage == 3:
+            last_done_date = lead.get("follow_up_2_date") or ""
+        elif stage == 4:
+            last_done_date = lead.get("follow_up_3_date") or ""
+
+        current_next = lead.get("next_touchpoint") or ""
+        if not current_next or (last_done_date and current_next <= last_done_date):
+            if scheduled:
+                conn.execute(
+                    f"UPDATE leads SET next_touchpoint = {_PH} "
+                    f"WHERE LOWER(user_name) = {_PH}",
+                    (scheduled, lead["user_name"]),
+                )
 
 
 def init_db():
@@ -466,7 +495,8 @@ def update_lead(user_name, **fields):
     prospective.update(clean)
     if any(clean.get(f"follow_up_{n}") == "Yes" for n in (1, 2, 3, 4)) \
             and "next_touchpoint" not in clean:
-        _, clean["next_touchpoint"] = scheduled_next_followup(prospective)
+        _, scheduled = scheduled_next_followup(prospective)
+        clean["next_touchpoint"] = scheduled or ""
     clean.setdefault("last_touchpoint", today_str())
     assignments = ", ".join(f"{k} = {_PH}" for k in clean)
     conn = _connect()
