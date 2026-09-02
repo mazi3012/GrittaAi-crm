@@ -79,6 +79,7 @@ from db import (  # noqa: E402  (after env validation)
     find_bot_user,
     get_lead,
     normalize_username,
+    next_unfinished_followup,
     overdue_leads_for_sender,
     profile_link_for,
     scheduled_next_followup,
@@ -745,9 +746,41 @@ def render_followup_card(lead, stage, due, when):
     return text, followup_card_keyboard(username, stage, profile)
 
 
-def render_followups(rows):
-    """Return a header and separate actionable card for every pending lead."""
+def followup_stage_keyboard(rows):
+    """Show only unfinished follow-up stages that are due now."""
+    today = today_str()
+    counts = {stage: 0 for stage in (1, 2, 3, 4)}
+    terminal = {"Not Interested", "Lost", "Won"}
+    for lead in rows:
+        if lead.get("status") in terminal:
+            continue
+        stage = next_unfinished_followup(lead)
+        when = lead.get("next_touchpoint") or ""
+        if stage and (not when or when <= today):
+            counts[stage] += 1
+
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    buttons = []
+    for stage in (1, 2, 3, 4):
+        if counts[stage]:
+            buttons.append(types.InlineKeyboardButton(
+                f"🔁 Follow-up {stage} ({counts[stage]})",
+                callback_data=f"fustage:{stage}"))
+    if buttons:
+        kb.add(*buttons)
+    else:
+        kb.add(types.InlineKeyboardButton(
+            "✅ No follow-ups due", callback_data="noop"))
+    kb.add(types.InlineKeyboardButton("🏠 Home", callback_data="menu:home"))
+    return kb
+
+
+def render_followups(rows, selected_stage=None):
+    """Return a stage selector and cards for one due follow-up stage."""
     header = "🔁 <b>My Follow-ups</b>\n\n"
+    if selected_stage is None:
+        return [(header + "Choose a follow-up stage to view due leads.",
+                 followup_stage_keyboard(rows))]
     today = today_str()
     grouped = {stage: [] for stage in (1, 2, 3, 4)}
     terminal = {"Not Interested", "Lost", "Won"}
@@ -757,28 +790,28 @@ def render_followups(rows):
             continue
         next_n = next((i for i in (1, 2, 3, 4)
                        if lead[f"follow_up_{i}"] != "Yes"), None)
-        if next_n is not None:
+        if next_n is not None and next_n == selected_stage:
             when = lead.get("next_touchpoint") or ""
             # Keep future follow-ups hidden until their scheduled day. This
             # leaves the list focused on the leads that can be actioned now.
-            if when and when > today:
+            if not when or when > today:
                 continue
             due = bool(when and when <= today)
             grouped[next_n].append((lead, due, when))
 
     pending_rows = [item for stage in grouped.values() for item in stage]
     if not pending_rows:
-        return [(header + "✅ You have no pending follow-ups.", home_button_kb())]
+        return [(header + f"<b>Follow-up {selected_stage}</b>\n\n"
+                 "✅ No follow-ups are due yet.",
+                 followup_stage_keyboard(rows))]
 
     due_count = sum(1 for _, due, _ in pending_rows if due)
-    unscheduled_count = sum(1 for _, _, when in pending_rows if not when)
     summary = [f"Pending: <b>{len(pending_rows)}</b>"]
     if due_count:
         summary.append(f"🔔 Due: <b>{due_count}</b>")
-    if unscheduled_count:
-        summary.append(f"🗓 Unscheduled: <b>{unscheduled_count}</b>")
 
-    cards = [(header + " · ".join(summary), home_button_kb())]
+    cards = [(header + f"<b>Follow-up {selected_stage}</b> · "
+              + " · ".join(summary), followup_stage_keyboard(rows))]
     for stage, stage_rows in grouped.items():
         if not stage_rows:
             continue
@@ -1617,6 +1650,33 @@ def on_menu(call):
             bot.send_message(chat_id, card_text, parse_mode="HTML", reply_markup=card_kb)
 
 
+@bot.callback_query_handler(func=lambda c: c.data.startswith("fustage:"))
+@member_callback
+def on_followup_stage(call):
+    """Open only the due leads belonging to the selected follow-up stage."""
+    try:
+        stage = int(call.data[len("fustage:"):])
+        if stage not in (1, 2, 3, 4):
+            raise ValueError
+    except ValueError:
+        bot.answer_callback_query(call.id, "Invalid follow-up stage.", show_alert=True)
+        return
+
+    viewer = callback_sender_handle(call)
+    cards = render_followups(my_leads_for(viewer), selected_stage=stage)
+    chat_id = call.message.chat.id
+    try:
+        bot.edit_message_text(cards[0][0], chat_id, call.message.message_id,
+                              parse_mode="HTML", reply_markup=cards[0][1])
+    except Exception as exc:
+        if "message is not modified" not in str(exc).lower():
+            bot.send_message(chat_id, cards[0][0], parse_mode="HTML",
+                             reply_markup=cards[0][1])
+    bot.answer_callback_query(call.id)
+    for card_text, card_kb in cards[1:]:
+        bot.send_message(chat_id, card_text, parse_mode="HTML", reply_markup=card_kb)
+
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith("lead:"))
 @member_callback
 def on_lead_card(call):
@@ -1783,7 +1843,19 @@ def on_followup_done(call):
         username,
         **{f"follow_up_{stage}": "Yes", "next_touchpoint": next_touchpoint},
     )
-    refresh_followup_cards(call)
+    # Replace the completed card with a freshly counted stage menu. This
+    # immediately removes the completed stage from its button count (and the
+    # next stage stays hidden until its scheduled date).
+    try:
+        selector_text = "🔁 <b>My Follow-ups</b>\n\nChoose a follow-up stage to view due leads."
+        bot.edit_message_text(
+            selector_text, call.message.chat.id, call.message.message_id,
+            parse_mode="HTML",
+            reply_markup=followup_stage_keyboard(
+                my_leads_for(callback_sender_handle(call))),
+        )
+    except Exception:
+        refresh_followup_cards(call)
     bot.answer_callback_query(call.id, f"✅ FU{stage} completed")
 
 
