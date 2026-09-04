@@ -37,7 +37,7 @@ let DATA_READY = false;
 let DATA_SIGNATURE = "";
 let LOADING = false;
 let POLL_HANDLE = null;
-let TIMER = null, PAUSED = false, LAST_ERR_TOAST = 0;
+let LAST_ERR_TOAST = 0;
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -763,8 +763,8 @@ async function loadUsers() {
 function updateBotStatus() {
   const dot = $("liveDot"), lbl = $("liveLbl"), bs = $("botStatus");
   if (!lbl) return;
-  lbl.textContent = PAUSED ? "Paused" : "Live";
-  if (dot) dot.style.background = PAUSED ? "#fbbf24" : "#34d399";
+  lbl.textContent = "Live";
+  if (dot) dot.style.background = "#34d399";
   if (bs) bs.title = `${USERS.length} Telegram users seen`;
 }
 function renderAccess() {
@@ -819,8 +819,6 @@ function wireLogin() {
 async function load({ silent = false } = {}) {
   if (LOADING) return;
   LOADING = true;
-  const refreshBtn = $("refreshBtn");
-  if (refreshBtn) refreshBtn.classList.add("is-loading");
   try {
     const data = await api("/api/leads");
     const nextLeads = data.leads || [];
@@ -842,19 +840,18 @@ async function load({ silent = false } = {}) {
     }
   } finally {
     LOADING = false;
-    if (refreshBtn) refreshBtn.classList.remove("is-loading");
   }
 }
 function startPolling() {
   clearTimeout(POLL_HANDLE);
   const poll = async () => {
-    if (!PAUSED && !DRAWER_USER) await load({ silent: true });
+    if (!DRAWER_USER) await load({ silent: true });
     POLL_HANDLE = setTimeout(poll, 5000);
   };
   POLL_HANDLE = setTimeout(poll, 5000);
 }
 
-/* ---------- theme / pause / render root ---------- */
+/* ---------- theme / render root ---------- */
 function applyTheme(mode) {
   document.documentElement.dataset.theme = mode;
   localStorage.setItem("gretta-theme", mode);
@@ -863,13 +860,6 @@ function applyTheme(mode) {
 function toggleTheme() {
   applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
   if (VIEW === "overview") renderOverview();
-}
-function togglePause() {
-  PAUSED = !PAUSED;
-  $("pauseBtn").textContent = PAUSED ? "▶ Resume updates" : "⏸ Pause updates";
-  $("pauseBtn").title = PAUSED ? "Resume live polling" : "Pause live polling";
-  updateBotStatus();
-  toast(PAUSED ? "Auto-refresh paused" : "Auto-refresh resumed");
 }
 function render() {
   if (VIEW === "overview") renderOverview();
@@ -1010,8 +1000,6 @@ function wireDrawerEvents() {
 
 function wireEvents() {
   document.querySelectorAll(".nav-btn").forEach(b => b.addEventListener("click", () => switchView(b.dataset.view)));
-  $("refreshBtn").addEventListener("click", () => load());
-  $("pauseBtn").addEventListener("click", togglePause);
   $("csvBtn").addEventListener("click", exportCsv);
   $("themeBtn").addEventListener("click", toggleTheme);
   $("q").addEventListener("input", (e) => {
