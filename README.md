@@ -119,7 +119,7 @@ Basumatary` as the canonical setter name.
 2. Vercel automatically detects the root-level `index.py` FastAPI entrypoint.
 3. In Project Settings -> **Environment Variables**, set `DATABASE_URL` to the same Neon Postgres connection string used by the Telegram bot.
 4. To enable the dashboard Assistant, add `OPENROUTER_API_KEY` with your OpenRouter key. Optionally add `ASSISTANT_MODEL` to override the default assistant model (otherwise `MODEL` is used).
-5. If admin authentication is enabled, also add `ADMIN_PASSWORD` and, optionally, `ADMIN_USERNAME` and `ADMIN_SESSION_SECRET`.
+5. Add `NEON_AUTH_BASE_URL` (from Neon Console → production branch → Auth → Configuration), `GRITTA_AUTH_INVITED_EMAILS` (comma-separated invited work emails), and `AUTH_COOKIE_SECURE=true`.
 6. For a temporary SQLite-only deployment, set `DB_PATH` to `/tmp/crm.db`; Vercel storage is otherwise ephemeral and should not be used as the shared CRM database.
 7. Redeploy after adding or changing environment variables. Your CRM dashboard will be live at `https://your-project.vercel.app`.
 
@@ -156,9 +156,9 @@ Basumatary` as the canonical setter name.
 | `DATABASE_URL` | Neon Postgres connection string — shared DB for Render + Vercel; omit for local SQLite | — |
 | `DB_PATH` | Path to SQLite database (used only when `DATABASE_URL` is unset) | `crm.db` |
 | `PORT` | Health server / web port | `7860` (HF) / `8000` (Local) |
-| `ADMIN_USERNAME` | Dashboard admin username | `admin` |
-| `ADMIN_PASSWORD` | **Set it in prod!** Enables the dashboard sign-in gate (`/api/*` locked behind a signed HttpOnly session cookie). Empty = open API (local dev only). | — |
-| `ADMIN_SESSION_SECRET` | Optional cookie-signing secret; rotating signs out all sessions | falls back to `ADMIN_PASSWORD` |
+| `NEON_AUTH_BASE_URL` | Neon Managed Better Auth base URL for the production branch | — |
+| `GRITTA_AUTH_INVITED_EMAILS` | Comma-separated invited CRM email addresses | — |
+| `AUTH_COOKIE_SECURE` | Secure app session cookie flag; keep `true` in production | `true` |
 | `ALLOWED_TELEGRAM_IDS` | Comma-separated numeric Telegram IDs allowed to use the bot. Empty both lists = bot open to everyone (still fully logged). | — |
 | `ALLOWED_TELEGRAM_USERNAMES` | Comma-separated @handles allowed to use the bot | — |
 | `GOOGLE_SHEET_WEBAPP_URL` | Apps Script Web App `/exec` URL — enables the live Google Sheets backup mirror ([setup guide](#-google-sheets-backup-live-mirror-for-the-team)) | — |
@@ -177,6 +177,6 @@ Basumatary` as the canonical setter name.
 - The dashboard board/table, the Telegram cards and the Google Sheet mirror all share these exact values, so nothing drifts between them.
 - Guardrails live once in `db.STAGE_TRANSITIONS` and are enforced by the DB layer itself — the UI merely mirrors them.
 
-**Dashboard auth:** set `ADMIN_PASSWORD` (e.g. in Vercel env vars) and the whole API requires signing in at the glass login screen. Sessions are stateless signed cookies (7 days) — no database needed, works across serverless cold starts. Sign out anytime from the sidebar.
+**Dashboard auth:** Neon Managed Better Auth is enabled on the production branch. Create the 5–10 user accounts from Neon Auth/Console, keep public sign-up disabled (or create users through the Neon management API), and set `GRITTA_AUTH_INVITED_EMAILS` in Vercel. The FastAPI app proxies email/password sign-in to Neon Auth, stores only an HttpOnly `__Host-gretta_auth` cookie, and validates the live Neon session before every CRM API request. Sign out anytime from the sidebar.
 
 **Bot access control:** every Telegram account that messages the bot is recorded in the `bot_users` table (message counts, first/last seen, whitelist flag) — visible in the dashboard's **🛡 Bot Access** tab with Allow/Deny buttons, or via `/users` in Telegram. To hard-lock the bot, set `ALLOWED_TELEGRAM_IDS` / `ALLOWED_TELEGRAM_USERNAMES`; strangers then get a polite refusal showing their ID so you can `/allow <id>` them.

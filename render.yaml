@@ -35,6 +35,12 @@ services:
       # to its own throwaway SQLite file.
       - key: DATABASE_URL
         sync: false
+      - key: NEON_AUTH_BASE_URL
+        sync: false
+      - key: GRITTA_AUTH_INVITED_EMAILS
+        sync: false
+      - key: AUTH_COOKIE_SECURE
+        value: "true"
       - key: MODEL
         value: stealth/ox-alpha
       - key: GROQ_MODEL

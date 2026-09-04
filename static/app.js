@@ -805,7 +805,7 @@ function wireLogin() {
     $("loginErr").textContent = "";
     try {
       await api("/api/auth/login", { method: "POST",
-        body: { username: $("loginUser").value, password: $("loginPass").value } });
+        body: { email: $("loginUser").value, password: $("loginPass").value } });
       hideLogin(); await load();
     } catch (err) { $("loginErr").textContent = err.message; }
   });

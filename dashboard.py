@@ -9,13 +9,13 @@ Serves:
   POST /api/lead/note       → {username, note}       append a note to the summary
   POST /api/lead/next_steps → {username, next_steps} set the next step
 
-Admin auth (enabled automatically when ADMIN_PASSWORD is set):
+Neon Auth (enabled when NEON_AUTH_BASE_URL is set):
   GET  /api/auth/status     → {auth_required, authenticated}
-  POST /api/auth/login      → {password}             sets a signed session cookie
+  POST /api/auth/login      → {email, password}      proxies Neon Auth login
   POST /api/auth/logout     → clears the session cookie
 Every other /api/* route returns 401 until a valid session cookie is present.
-Sessions are stateless: HMAC-signed expiry timestamps, so they survive
-Vercel's serverless cold starts without any storage.
+ Sessions are owned and checked by Neon Auth; the app only stores an opaque,
+ HttpOnly same-origin cookie.
 
 Bot access control:
   GET  /api/users           → every Telegram account that talked to the bot
@@ -31,18 +31,19 @@ Run with either:
     uvicorn dashboard:app --host 0.0.0.0 --port 8000
 """
 
-import hmac
 import json
 import os
 import time
 import urllib.error
 import urllib.request
+from http.cookies import SimpleCookie
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from starlette.concurrency import run_in_threadpool
 
 load_dotenv()
 
@@ -68,53 +69,85 @@ MAX_TEXT = 4000  # sanity cap for note payloads
 app = FastAPI(title="Gritta CRM")
 
 # --------------------------------------------------------------------- auth
-# Set ADMIN_PASSWORD in the environment (local .env or Vercel/Render env vars)
-# to lock the dashboard down. Without it the API stays open for local dev —
-# but NEVER deploy publicly without setting it.
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin").strip() or "admin"
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
-AUTH_ENABLED = bool(ADMIN_PASSWORD)
-SESSION_SECRET = os.getenv("ADMIN_SESSION_SECRET", "").strip() or ADMIN_PASSWORD
-COOKIE_NAME = "gretta_session"
-SESSION_TTL = 7 * 24 * 3600  # one week per sign-in
+# Neon Auth is the identity/session authority. The app cookie contains only
+# Neon’s opaque session token; it is never decoded or trusted locally.
+NEON_AUTH_BASE_URL = os.getenv("NEON_AUTH_BASE_URL", "").strip().rstrip("/")
+INVITED_EMAILS = {
+    email.strip().lower()
+    for email in os.getenv("GRITTA_AUTH_INVITED_EMAILS", "").split(",")
+    if email.strip()
+}
+AUTH_COOKIE = "__Host-gretta_auth"
+AUTH_COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "true").lower() == "true"
+AUTH_ENABLED = bool(NEON_AUTH_BASE_URL)
+NEON_SESSION_COOKIE = "__Secure-neonauth.session_token"
 
 
-def _sign(payload: str) -> str:
-    return hmac.new(SESSION_SECRET.encode(), payload.encode(),
-                    "sha256").hexdigest()
+def _auth_url(path: str) -> str:
+    return f"{NEON_AUTH_BASE_URL}/{path.lstrip('/')}"
 
 
-def _make_token() -> str:
-    expires = int(time.time()) + SESSION_TTL
-    return f"{expires}.{_sign(str(expires))}"
-
-
-def _token_ok(token) -> bool:
-    """Constant-time check of 'expiry.hexsig' session tokens."""
-    if not token or "." not in token:
-        return False
-    expires, _, sig = token.partition(".")
-    if not expires.isdigit():
-        return False
+def _neon_request(path: str, method: str = "GET", body=None, session_token=None):
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    if session_token:
+        headers["Cookie"] = f"{NEON_SESSION_COOKIE}={session_token}"
+    request = urllib.request.Request(
+        _auth_url(path),
+        data=json.dumps(body).encode() if body is not None else None,
+        headers=headers,
+        method=method,
+    )
     try:
-        valid = hmac.compare_digest(sig, _sign(expires))
-    except Exception:
-        return False
-    return valid and int(expires) >= int(time.time())
+        with urllib.request.urlopen(request, timeout=8) as upstream:
+            raw_cookie = upstream.headers.get("Set-Cookie", "")
+            return upstream.status, json.loads(upstream.read() or b"{}"), raw_cookie
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read() or b"{}")
+        except (ValueError, TypeError):
+            detail = {}
+        return exc.code, detail, ""
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return 503, {}, ""
+
+
+def _session_from_request(request: Request):
+    return request.cookies.get(AUTH_COOKIE)
+
+
+def _valid_session(session_token):
+    if not AUTH_ENABLED or not session_token:
+        return None
+    status, data, _ = _neon_request("get-session", session_token=session_token)
+    if status != 200:
+        return None
+    session = data.get("session") or data.get("data", {}).get("session")
+    user = data.get("user") or data.get("data", {}).get("user")
+    if not session or not user:
+        return None
+    email = str(user.get("email", "")).strip().lower()
+    if INVITED_EMAILS and email not in INVITED_EMAILS:
+        return None
+    return {"session": session, "user": user}
+
+
+def _same_origin(request: Request) -> bool:
+    origin = request.headers.get("origin")
+    if not origin:
+        return True  # non-browser clients do not send Origin
+    return origin == str(request.base_url).rstrip("/")
 
 
 @app.middleware("http")
 async def auth_guard(request: Request, call_next):
-    """Gate every /api/* route behind the admin session cookie.
-
-    /api/auth/* stays public (login/status/logout need to be reachable) and
-    everything else — leads, mutations, user lists — requires a valid cookie
-    whenever ADMIN_PASSWORD is configured.
-    """
+    """Gate every API route behind a live Neon Auth session."""
     path = request.url.path
-    if (AUTH_ENABLED and path.startswith("/api")
-            and not path.startswith("/api/auth")):
-        if not _token_ok(request.cookies.get(COOKIE_NAME)):
+    if AUTH_ENABLED and path.startswith("/api"):
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and not _same_origin(request):
+            return JSONResponse(status_code=403, content={"ok": False, "error": "Invalid origin"})
+        if path.startswith("/api/auth"):
+            return await call_next(request)
+        if not await run_in_threadpool(_valid_session, _session_from_request(request)):
             return JSONResponse(
                 status_code=401,
                 content={"ok": False, "error": "Not authenticated"},
@@ -123,41 +156,47 @@ async def auth_guard(request: Request, call_next):
 
 
 class LoginIn(BaseModel):
-    username: str = Field(default="", max_length=120)
-    password: str = Field(min_length=1, max_length=200)
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=8, max_length=200)
 
 
 @app.get("/api/auth/status")
-def api_auth_status(request: Request):
-    """SPA boot check: is a password configured, and do we hold a session?"""
-    authenticated = (not AUTH_ENABLED) or _token_ok(request.cookies.get(COOKIE_NAME))
-    return {"auth_required": AUTH_ENABLED, "authenticated": authenticated}
+async def api_auth_status(request: Request):
+    session = await run_in_threadpool(_valid_session, _session_from_request(request))
+    return {"auth_required": AUTH_ENABLED, "authenticated": bool(session),
+            "user": session["user"] if session else None}
 
 
 @app.post("/api/auth/login")
 def api_auth_login(payload: LoginIn, response: Response):
-    """Verify credentials and set a signed, HttpOnly session cookie."""
+    """Proxy email/password login to Neon Auth without exposing its cookie domain."""
     if not AUTH_ENABLED:
-        return {"ok": True, "auth_required": False}
-    user_ok = hmac.compare_digest(payload.username.strip().lower().encode(),
-                                  ADMIN_USERNAME.lower().encode())
-    pass_ok = hmac.compare_digest(payload.password.encode(),
-                                  ADMIN_PASSWORD.encode())
-    if not (user_ok and pass_ok):
-        time.sleep(0.4)  # cheap brute-force damper
-        return JSONResponse(status_code=401,
-                            content={"ok": False,
-                                     "error": "Wrong username or password"})
-    response.set_cookie(
-        COOKIE_NAME, _make_token(), max_age=SESSION_TTL,
-        httponly=True, samesite="lax",
+        return JSONResponse(status_code=503, content={"ok": False, "error": "Authentication is not configured"})
+    if INVITED_EMAILS and payload.email.strip().lower() not in INVITED_EMAILS:
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Invalid email or password"})
+    status, data, set_cookie = _neon_request(
+        "sign-in/email", "POST", {"email": payload.email.strip(), "password": payload.password}
     )
-    return {"ok": True, "auth_required": True}
+    if status != 200:
+        time.sleep(0.25)
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Invalid email or password"})
+    cookie = SimpleCookie()
+    cookie.load(set_cookie)
+    token = cookie.get(NEON_SESSION_COOKIE)
+    if not token:
+        return JSONResponse(status_code=502, content={"ok": False, "error": "Authentication provider error"})
+    response.set_cookie(AUTH_COOKIE, token.value, httponly=True, secure=AUTH_COOKIE_SECURE,
+                        samesite="lax", path="/")
+    user = data.get("user") or data.get("data", {}).get("user")
+    return {"ok": True, "auth_required": True, "user": user}
 
 
 @app.post("/api/auth/logout")
-def api_auth_logout(response: Response):
-    response.delete_cookie(COOKIE_NAME)
+def api_auth_logout(request: Request, response: Response):
+    token = _session_from_request(request)
+    if token:
+        _neon_request("sign-out", "POST", session_token=token)
+    response.delete_cookie(AUTH_COOKIE, path="/")
     return {"ok": True}
 
 
