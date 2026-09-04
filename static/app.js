@@ -788,16 +788,114 @@ function renderAccess() {
 }
 
 /* ---------- auth gate ---------- */
-function showLogin() { const g = $("loginGate"); if (g) g.style.display = "flex"; }
-function hideLogin() { const g = $("loginGate"); if (g) g.style.display = "none"; }
+let CURRENT_USER = null;
+
+function showLogin(defaultTab = "signin") {
+  const g = $("loginGate");
+  if (g) {
+    g.style.display = "flex";
+    switchAuthTab(defaultTab);
+  }
+}
+
+function hideLogin() {
+  const g = $("loginGate");
+  if (g) g.style.display = "none";
+}
+
+function switchAuthTab(tabName) {
+  const tabs = document.querySelectorAll(".auth-tab");
+  tabs.forEach(t => {
+    t.classList.toggle("active", t.dataset.authTab === tabName);
+  });
+  
+  const forms = ["signin", "setup", "reset"];
+  forms.forEach(name => {
+    const el = $(`auth-panel-${name}`);
+    if (el) el.style.display = (name === tabName) ? "block" : "none";
+  });
+
+  setAuthFeedback("", "none");
+}
+
+function setAuthFeedback(msg, type = "err", panelId = null) {
+  const feedbackEls = document.querySelectorAll(".auth-feedback");
+  feedbackEls.forEach(el => {
+    if (!panelId || el.id === panelId) {
+      el.className = `auth-feedback ${type}`;
+      el.textContent = msg;
+      el.style.display = msg ? "block" : "none";
+    }
+  });
+}
+
+function updateSidebarUser(user) {
+  CURRENT_USER = user;
+  const userProfile = $("sidebarUserProfile");
+  const userEmail = $("sidebarUserEmail");
+  const userAvatar = $("sidebarUserAvatar");
+  const logoutBtn = $("logoutBtn");
+
+  if (user && user.email) {
+    if (userProfile) userProfile.style.display = "flex";
+    if (userEmail) userEmail.textContent = user.name || user.email;
+    if (userAvatar) {
+      userAvatar.textContent = initials(user.name || user.email);
+      userAvatar.style.background = avColor(user.email);
+    }
+    if (logoutBtn) logoutBtn.style.display = "flex";
+  } else {
+    if (userProfile) userProfile.style.display = "none";
+    if (logoutBtn) logoutBtn.style.display = "none";
+  }
+}
+
 async function initAuth() {
+  const urlParams = new URLSearchParams(window.location.search);
+  const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, "?"));
+  const resetToken = urlParams.get("token") || hashParams.get("token") || urlParams.get("reset_token");
+
   try {
     const st = await api("/api/auth/status");
     AUTH_REQUIRED = st.auth_required;
-    if (st.auth_required && !st.authenticated) showLogin();
-    else hideLogin();
-    return !(st.auth_required && !st.authenticated);
-  } catch { showLogin(); return false; }
+    if (st.authenticated && st.user) {
+      updateSidebarUser(st.user);
+      hideLogin();
+      return true;
+    }
+
+    if (resetToken) {
+      showLogin("reset");
+      const tokenInput = $("resetTokenInput");
+      if (tokenInput) tokenInput.value = resetToken;
+      const step2 = $("resetStep2");
+      if (step2) step2.style.display = "block";
+      const step1 = $("resetStep1");
+      if (step1) step1.style.display = "none";
+      setAuthFeedback("Reset token detected from email link. Enter your new password below.", "success");
+      return false;
+    }
+
+    if (st.auth_required && !st.authenticated) {
+      showLogin("signin");
+      return false;
+    }
+    hideLogin();
+    return true;
+  } catch (e) {
+    if (resetToken) {
+      showLogin("reset");
+      const tokenInput = $("resetTokenInput");
+      if (tokenInput) tokenInput.value = resetToken;
+      const step2 = $("resetStep2");
+      if (step2) step2.style.display = "block";
+      const step1 = $("resetStep1");
+      if (step1) step1.style.display = "none";
+      return false;
+    }
+    showLogin("signin");
+    return false;
+  }
 }
 function wireLogin() {
   $("loginForm").addEventListener("submit", async (e) => {

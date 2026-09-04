@@ -35,7 +35,14 @@
     </nav>
 
     <div class="sidebar-footer">
-      <button id="logoutBtn" class="icon-btn" style="display:none;width:100%;" title="End the admin session">⏻ Sign out</button>
+      <div id="sidebarUser" class="sidebar-user-card glass" style="display:none;">
+        <span id="sidebarUserAvatar" class="avatar user-av">GR</span>
+        <div class="sidebar-user-meta">
+          <div id="sidebarUserName" class="sidebar-user-name">Team Member</div>
+          <div id="sidebarUserEmail" class="sidebar-user-email">user@company.com</div>
+        </div>
+        <button id="logoutBtn" class="user-logout-btn" title="Sign out" aria-label="Sign out">⏻</button>
+      </div>
       <div class="health-card glass">
         <div class="health-label">Pipeline Health</div>
         <div class="bar-mini"><div id="healthBar" style="width:0%"></div></div>
@@ -90,17 +97,160 @@
   </div>
 </div>
 
-<!-- ══════════ ADMIN LOGIN GATE ══════════ -->
-<div id="loginGate">
-  <form id="loginForm" class="glass login-box">
-    <img class="login-logo" src="/static/gritta-logo-light.svg" data-light-logo="/static/gritta-logo-light.svg" data-dark-logo="/static/gritta-logo-dark.svg" alt="Gritta CRM logo"/>
-    <h2>Gritta CRM</h2>
-    <p>Sign in with your invited Gritta account.</p>
-    <input id="loginUser" type="email" placeholder="Work email" autocomplete="email" required/>
-    <input id="loginPass" type="password" placeholder="Password" autocomplete="current-password" required/>
-    <div id="loginErr" class="login-err"></div>
-    <button id="loginSubmitBtn" type="submit" class="icon-btn primary" style="width:100%;height:40px;">🔐 Sign in</button>
-  </form>
+<!-- ══════════ AUTHENTICATION GATE ══════════ -->
+<div id="loginGate" class="auth-gate-backdrop">
+  <div class="glass auth-card">
+    <div class="auth-header">
+      <div class="auth-logo-badge">
+        <img class="login-logo" src="/static/gritta-logo-light.svg" data-light-logo="/static/gritta-logo-light.svg" data-dark-logo="/static/gritta-logo-dark.svg" alt="Gritta CRM"/>
+      </div>
+      <div class="auth-title-group">
+        <h2 class="auth-title">Gritta CRM</h2>
+        <span class="auth-subtitle">Command Center Access</span>
+      </div>
+      <div class="auth-security-badge">
+        <span class="auth-badge-dot"></span>
+        <span>Invited Members Only</span>
+      </div>
+    </div>
+
+    <!-- Mode Selector Tabs -->
+    <div class="auth-nav-tabs">
+      <button type="button" class="auth-tab-btn active" data-auth-tab="signin">Sign In</button>
+      <button type="button" class="auth-tab-btn" data-auth-tab="reset">Reset Password</button>
+      <button type="button" class="auth-tab-btn" data-auth-tab="activate">Activate / Set Up</button>
+    </div>
+
+    <!-- Feedback Message Container -->
+    <div id="authAlert" class="auth-alert" style="display:none;"></div>
+
+    <!-- 1. SIGN IN FORM -->
+    <form id="loginForm" class="auth-form-panel active" autocomplete="on">
+      <div class="auth-field">
+        <label class="auth-label" for="loginUser">Work Email</label>
+        <div class="auth-input-wrap">
+          <span class="auth-input-ico">✉️</span>
+          <input id="loginUser" type="email" class="auth-input" placeholder="name@company.com" autocomplete="email" required/>
+        </div>
+      </div>
+
+      <div class="auth-field">
+        <div class="auth-label-row">
+          <label class="auth-label" for="loginPass">Password</label>
+          <button type="button" class="auth-inline-link" data-switch-tab="reset">Forgot password?</button>
+        </div>
+        <div class="auth-input-wrap">
+          <span class="auth-input-ico">🔑</span>
+          <input id="loginPass" type="password" class="auth-input" placeholder="••••••••" autocomplete="current-password" required/>
+          <button type="button" class="auth-eye-btn" data-toggle-target="loginPass" aria-label="Toggle password visibility">👁</button>
+        </div>
+      </div>
+
+      <button id="loginSubmitBtn" type="submit" class="icon-btn primary auth-submit-btn">
+        <span class="btn-spinner" style="display:none;"></span>
+        <span class="btn-text">🔐 Sign In</span>
+      </button>
+
+      <div class="auth-panel-footer">
+        <span>First time here?</span>
+        <button type="button" class="auth-inline-link" data-switch-tab="activate">Set up your password</button>
+      </div>
+    </form>
+    <!-- 2. RESET PASSWORD FORM -->
+    <div id="resetPanel" class="auth-form-panel">
+      <!-- 2A. Request reset link -->
+      <form id="resetRequestForm" class="auth-sub-panel active">
+        <p class="auth-desc">Enter your work email and we will send you a secure link to reset or set your password.</p>
+        <div class="auth-field">
+          <label class="auth-label" for="resetEmail">Work Email</label>
+          <div class="auth-input-wrap">
+            <span class="auth-input-ico">✉️</span>
+            <input id="resetEmail" type="email" class="auth-input" placeholder="name@company.com" autocomplete="email" required/>
+          </div>
+        </div>
+
+        <button id="resetRequestBtn" type="submit" class="icon-btn primary auth-submit-btn">
+          <span class="btn-spinner" style="display:none;"></span>
+          <span class="btn-text">📨 Send Reset Link</span>
+        </button>
+
+        <div class="auth-or-divider"><span>OR</span></div>
+        <button type="button" id="haveTokenBtn" class="icon-btn secondary auth-alt-btn">I already have a reset token</button>
+      </form>
+
+      <!-- 2B. Reset with token -->
+      <form id="resetConfirmForm" class="auth-sub-panel" style="display:none;">
+        <p class="auth-desc">Enter the reset token from your email link and your new chosen password.</p>
+        <div class="auth-field">
+          <label class="auth-label" for="resetToken">Reset Token</label>
+          <div class="auth-input-wrap">
+            <span class="auth-input-ico">🎫</span>
+            <input id="resetToken" type="text" class="auth-input mono" placeholder="Paste token from email link" autocomplete="off" required/>
+          </div>
+        </div>
+
+        <div class="auth-field">
+          <label class="auth-label" for="resetNewPass">New Password</label>
+          <div class="auth-input-wrap">
+            <span class="auth-input-ico">🔒</span>
+            <input id="resetNewPass" type="password" class="auth-input" placeholder="Minimum 8 characters" minlength="8" autocomplete="new-password" required/>
+            <button type="button" class="auth-eye-btn" data-toggle-target="resetNewPass" aria-label="Toggle password visibility">👁</button>
+          </div>
+        </div>
+
+        <button id="resetConfirmBtn" type="submit" class="icon-btn primary auth-submit-btn">
+          <span class="btn-spinner" style="display:none;"></span>
+          <span class="btn-text">✨ Update Password & Sign In</span>
+        </button>
+
+        <button type="button" id="backToRequestBtn" class="auth-inline-link auth-center-link">← Request a new reset link</button>
+      </form>
+
+      <div class="auth-panel-footer">
+        <button type="button" class="auth-inline-link" data-switch-tab="signin">← Back to Sign In</button>
+      </div>
+    </div>
+
+    <!-- 3. ACTIVATE / SIGN UP FORM -->
+    <form id="signupForm" class="auth-form-panel" autocomplete="on">
+      <p class="auth-desc">Invited team members: set up your profile and password to activate your command center access.</p>
+      
+      <div class="auth-field">
+        <label class="auth-label" for="signupName">Full Name</label>
+        <div class="auth-input-wrap">
+          <span class="auth-input-ico">👤</span>
+          <input id="signupName" type="text" class="auth-input" placeholder="Your name" autocomplete="name"/>
+        </div>
+      </div>
+
+      <div class="auth-field">
+        <label class="auth-label" for="signupEmail">Work Email</label>
+        <div class="auth-input-wrap">
+          <span class="auth-input-ico">✉️</span>
+          <input id="signupEmail" type="email" class="auth-input" placeholder="name@company.com" autocomplete="email" required/>
+        </div>
+      </div>
+
+      <div class="auth-field">
+        <label class="auth-label" for="signupPass">Choose Password</label>
+        <div class="auth-input-wrap">
+          <span class="auth-input-ico">🔒</span>
+          <input id="signupPass" type="password" class="auth-input" placeholder="Minimum 8 characters" minlength="8" autocomplete="new-password" required/>
+          <button type="button" class="auth-eye-btn" data-toggle-target="signupPass" aria-label="Toggle password visibility">👁</button>
+        </div>
+      </div>
+
+      <button id="signupSubmitBtn" type="submit" class="icon-btn primary auth-submit-btn">
+        <span class="btn-spinner" style="display:none;"></span>
+        <span class="btn-text">🚀 Activate & Sign In</span>
+      </button>
+
+      <div class="auth-panel-footer">
+        <span>Already configured?</span>
+        <button type="button" class="auth-inline-link" data-switch-tab="signin">Sign In</button>
+      </div>
+    </form>
+  </div>
 </div>
 
 <div id="toasts"></div>

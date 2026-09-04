@@ -80,7 +80,6 @@ INVITED_EMAILS = {
 AUTH_COOKIE = "__Host-gretta_auth"
 AUTH_COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "true").lower() == "true"
 AUTH_ENABLED = bool(NEON_AUTH_BASE_URL)
-NEON_SESSION_COOKIE = "__Secure-neonauth.session_token"
 
 
 def _auth_url(path: str) -> str:
@@ -90,7 +89,13 @@ def _auth_url(path: str) -> str:
 def _neon_request(path: str, method: str = "GET", body=None, session_token=None):
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     if session_token:
-        headers["Cookie"] = f"{NEON_SESSION_COOKIE}={session_token}"
+        clean_token = str(session_token).strip()
+        headers["Cookie"] = (
+            f"__Secure-neon-auth.session_token={clean_token}; "
+            f"__Secure-neonauth.session_token={clean_token}; "
+            f"better-auth.session_token={clean_token}"
+        )
+        headers["Authorization"] = f"Bearer {clean_token.split('.')[0]}"
     request = urllib.request.Request(
         _auth_url(path),
         data=json.dumps(body).encode() if body is not None else None,
@@ -109,6 +114,24 @@ def _neon_request(path: str, method: str = "GET", body=None, session_token=None)
         return exc.code, detail, ""
     except (urllib.error.URLError, TimeoutError, ValueError):
         return 503, {}, ""
+
+
+def _extract_session_token(set_cookie: str, data: dict = None) -> Optional[str]:
+    if set_cookie:
+        cookie = SimpleCookie()
+        try:
+            cookie.load(set_cookie)
+            for key in ("__Secure-neon-auth.session_token", "__Secure-neonauth.session_token", "better-auth.session_token"):
+                if key in cookie:
+                    return cookie[key].value
+        except Exception:
+            pass
+    if isinstance(data, dict):
+        if data.get("token"):
+            return str(data["token"])
+        if data.get("data", {}).get("token"):
+            return str(data["data"]["token"])
+    return None
 
 
 def _session_from_request(request: Request):
@@ -157,7 +180,22 @@ async def auth_guard(request: Request, call_next):
 
 class LoginIn(BaseModel):
     email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=6, max_length=200)
+
+
+class RequestResetIn(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+
+
+class ResetPasswordIn(BaseModel):
+    token: str = Field(min_length=1, max_length=500)
+    new_password: str = Field(min_length=8, max_length=200)
+
+
+class SignUpIn(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
     password: str = Field(min_length=8, max_length=200)
+    name: Optional[str] = Field(default=None, max_length=100)
 
 
 @app.get("/api/auth/status")
@@ -172,23 +210,93 @@ def api_auth_login(payload: LoginIn, response: Response):
     """Proxy email/password login to Neon Auth without exposing its cookie domain."""
     if not AUTH_ENABLED:
         return JSONResponse(status_code=503, content={"ok": False, "error": "Authentication is not configured"})
-    if INVITED_EMAILS and payload.email.strip().lower() not in INVITED_EMAILS:
-        return JSONResponse(status_code=401, content={"ok": False, "error": "Invalid email or password"})
+    email_clean = payload.email.strip().lower()
+    if INVITED_EMAILS and email_clean not in INVITED_EMAILS:
+        return JSONResponse(status_code=401, content={"ok": False, "error": "Access restricted to invited team members"})
     status, data, set_cookie = _neon_request(
-        "sign-in/email", "POST", {"email": payload.email.strip(), "password": payload.password}
+        "sign-in/email", "POST", {"email": email_clean, "password": payload.password}
     )
     if status != 200:
         time.sleep(0.25)
-        return JSONResponse(status_code=401, content={"ok": False, "error": "Invalid email or password"})
-    cookie = SimpleCookie()
-    cookie.load(set_cookie)
-    token = cookie.get(NEON_SESSION_COOKIE)
+        err_msg = data.get("message") if isinstance(data, dict) else "Invalid email or password"
+        return JSONResponse(status_code=401, content={"ok": False, "error": err_msg or "Invalid email or password"})
+    token = _extract_session_token(set_cookie, data)
     if not token:
-        return JSONResponse(status_code=502, content={"ok": False, "error": "Authentication provider error"})
-    response.set_cookie(AUTH_COOKIE, token.value, httponly=True, secure=AUTH_COOKIE_SECURE,
+        return JSONResponse(status_code=502, content={"ok": False, "error": "Authentication session could not be established"})
+    response.set_cookie(AUTH_COOKIE, token, httponly=True, secure=AUTH_COOKIE_SECURE,
                         samesite="lax", path="/")
     user = data.get("user") or data.get("data", {}).get("user")
     return {"ok": True, "auth_required": True, "user": user}
+
+
+@app.post("/api/auth/request-reset")
+def api_auth_request_reset(payload: RequestResetIn, request: Request):
+    """Request a password reset link from Neon Auth."""
+    if not AUTH_ENABLED:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "Authentication is not configured"})
+    email_clean = payload.email.strip().lower()
+    if INVITED_EMAILS and email_clean not in INVITED_EMAILS:
+        return {"ok": True, "message": "If an invited account exists, a reset link has been dispatched."}
+    origin = request.headers.get("origin") or str(request.base_url).rstrip("/")
+    status, data, _ = _neon_request(
+        "request-password-reset",
+        "POST",
+        {"email": email_clean, "redirectTo": f"{origin}/"}
+    )
+    if status not in (200, 204):
+        err_msg = data.get("message") if isinstance(data, dict) else "Failed to send reset link"
+        return JSONResponse(status_code=status if status in (400, 429) else 500,
+                            content={"ok": False, "error": err_msg or "Failed to request password reset"})
+    return {"ok": True, "message": "Password reset instructions have been sent to your email."}
+
+
+@app.post("/api/auth/reset-password")
+def api_auth_reset_password(payload: ResetPasswordIn, response: Response):
+    """Complete a password reset with token."""
+    if not AUTH_ENABLED:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "Authentication is not configured"})
+    status, data, set_cookie = _neon_request(
+        "reset-password",
+        "POST",
+        {"token": payload.token.strip(), "newPassword": payload.new_password}
+    )
+    if status != 200:
+        err_msg = data.get("message") if isinstance(data, dict) else "Password reset failed"
+        return JSONResponse(status_code=status if status in (400, 422) else 500,
+                            content={"ok": False, "error": err_msg or "Invalid or expired reset token"})
+    token = _extract_session_token(set_cookie, data)
+    if token:
+        response.set_cookie(AUTH_COOKIE, token, httponly=True, secure=AUTH_COOKIE_SECURE,
+                            samesite="lax", path="/")
+    user = data.get("user") or data.get("data", {}).get("user")
+    return {"ok": True, "user": user, "message": "Password successfully updated!"}
+
+
+@app.post("/api/auth/signup")
+def api_auth_signup(payload: SignUpIn, response: Response):
+    """Set up initial password / account for invited team members."""
+    if not AUTH_ENABLED:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "Authentication is not configured"})
+    email_clean = payload.email.strip().lower()
+    if INVITED_EMAILS and email_clean not in INVITED_EMAILS:
+        return JSONResponse(status_code=403, content={"ok": False, "error": "Registration is invitation-only. Contact your admin."})
+    name = (payload.name or email_clean.split("@")[0]).strip()
+    status, data, set_cookie = _neon_request(
+        "sign-up/email",
+        "POST",
+        {"email": email_clean, "password": payload.password, "name": name}
+    )
+    if status != 200:
+        err_msg = data.get("message") if isinstance(data, dict) else "Signup failed"
+        return JSONResponse(status_code=status if status in (400, 409, 422) else 500,
+                            content={"ok": False, "error": err_msg or "Unable to complete account registration"})
+    token = _extract_session_token(set_cookie, data)
+    if not token:
+        return JSONResponse(status_code=502, content={"ok": False, "error": "Authentication session could not be established"})
+    response.set_cookie(AUTH_COOKIE, token, httponly=True, secure=AUTH_COOKIE_SECURE,
+                        samesite="lax", path="/")
+    user = data.get("user") or data.get("data", {}).get("user")
+    return {"ok": True, "user": user, "message": "Account created successfully"}
 
 
 @app.post("/api/auth/logout")
