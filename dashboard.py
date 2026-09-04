@@ -36,6 +36,7 @@ import os
 import time
 from typing import Optional
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.cookies import SimpleCookie
 
@@ -88,8 +89,37 @@ def _auth_url(path: str) -> str:
     return f"{NEON_AUTH_BASE_URL}/{path.lstrip('/')}"
 
 
-def _neon_request(path: str, method: str = "GET", body=None, session_token=None):
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+def _get_request_origin(request: Optional[Request] = None) -> str:
+    if request is not None:
+        origin = request.headers.get("origin")
+        if origin:
+            return origin.rstrip("/")
+        referer = request.headers.get("referer")
+        if referer:
+            try:
+                parsed = urllib.parse.urlparse(referer)
+                if parsed.scheme and parsed.netloc:
+                    return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+            except Exception:
+                pass
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+        if host:
+            proto = request.headers.get("x-forwarded-proto") or request.url.scheme or "https"
+            return f"{proto}://{host}".rstrip("/")
+        base = str(request.base_url).rstrip("/")
+        if base and not base.startswith("http://127.0.0.1") and not base.startswith("http://localhost"):
+            return base
+    return "https://gritta-ai-crm.vercel.app"
+
+
+def _neon_request(path: str, method: str = "GET", body=None, session_token=None, origin: Optional[str] = None):
+    origin_header = origin or "https://gritta-ai-crm.vercel.app"
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": origin_header,
+        "Referer": f"{origin_header}/",
+    }
     if session_token:
         clean_token = str(session_token).strip()
         headers["Cookie"] = (
@@ -133,6 +163,10 @@ def _extract_session_token(set_cookie: str, data: dict = None) -> Optional[str]:
             return str(data["token"])
         if data.get("data", {}).get("token"):
             return str(data["data"]["token"])
+        if isinstance(data.get("session"), dict) and data["session"].get("token"):
+            return str(data["session"]["token"])
+        if isinstance(data.get("data", {}).get("session"), dict) and data["data"]["session"].get("token"):
+            return str(data["data"]["session"]["token"])
     return None
 
 
@@ -140,10 +174,10 @@ def _session_from_request(request: Request):
     return request.cookies.get(AUTH_COOKIE)
 
 
-def _valid_session(session_token):
+def _valid_session(session_token, origin: Optional[str] = None):
     if not AUTH_ENABLED or not session_token:
         return None
-    status, data, _ = _neon_request("get-session", session_token=session_token)
+    status, data, _ = _neon_request("get-session", session_token=session_token, origin=origin)
     if status != 200:
         return None
     session = data.get("session") or data.get("data", {}).get("session")
@@ -160,7 +194,18 @@ def _same_origin(request: Request) -> bool:
     origin = request.headers.get("origin")
     if not origin:
         return True  # non-browser clients do not send Origin
-    return origin == str(request.base_url).rstrip("/")
+    origin = origin.rstrip("/").lower()
+    base = str(request.base_url).rstrip("/").lower()
+    if origin == base:
+        return True
+    host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or "").lower()
+    if host:
+        proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "https").lower()
+        if origin == f"{proto}://{host}" or origin.endswith(f"://{host}"):
+            return True
+    if origin in {"https://gritta-ai-crm.vercel.app", "http://localhost:8000", "http://127.0.0.1:8000"}:
+        return True
+    return False
 
 
 @app.middleware("http")
@@ -172,7 +217,8 @@ async def auth_guard(request: Request, call_next):
             return JSONResponse(status_code=403, content={"ok": False, "error": "Invalid origin"})
         if path.startswith("/api/auth"):
             return await call_next(request)
-        if not await run_in_threadpool(_valid_session, _session_from_request(request)):
+        origin = _get_request_origin(request)
+        if not await run_in_threadpool(_valid_session, _session_from_request(request), origin):
             return JSONResponse(
                 status_code=401,
                 content={"ok": False, "error": "Not authenticated"},
@@ -202,21 +248,26 @@ class SignUpIn(BaseModel):
 
 @app.get("/api/auth/status")
 async def api_auth_status(request: Request):
-    session = await run_in_threadpool(_valid_session, _session_from_request(request))
+    origin = _get_request_origin(request)
+    session = await run_in_threadpool(_valid_session, _session_from_request(request), origin)
     return {"auth_required": AUTH_ENABLED, "authenticated": bool(session),
             "user": session["user"] if session else None}
 
 
 @app.post("/api/auth/login")
-def api_auth_login(payload: LoginIn, response: Response):
+def api_auth_login(payload: LoginIn, request: Request, response: Response):
     """Proxy email/password login to Neon Auth without exposing its cookie domain."""
     if not AUTH_ENABLED:
         return JSONResponse(status_code=503, content={"ok": False, "error": "Authentication is not configured"})
     email_clean = payload.email.strip().lower()
     if INVITED_EMAILS and email_clean not in INVITED_EMAILS:
         return JSONResponse(status_code=401, content={"ok": False, "error": "Access restricted to invited team members"})
+    origin = _get_request_origin(request)
     status, data, set_cookie = _neon_request(
-        "sign-in/email", "POST", {"email": email_clean, "password": payload.password}
+        "sign-in/email",
+        "POST",
+        {"email": email_clean, "password": payload.password, "callbackURL": f"{origin}/"},
+        origin=origin,
     )
     if status != 200:
         time.sleep(0.25)
@@ -239,12 +290,20 @@ def api_auth_request_reset(payload: RequestResetIn, request: Request):
     email_clean = payload.email.strip().lower()
     if INVITED_EMAILS and email_clean not in INVITED_EMAILS:
         return {"ok": True, "message": "If an invited account exists, a reset link has been dispatched."}
-    origin = request.headers.get("origin") or str(request.base_url).rstrip("/")
+    origin = _get_request_origin(request)
     status, data, _ = _neon_request(
-        "request-password-reset",
+        "forget-password",
         "POST",
-        {"email": email_clean, "redirectTo": f"{origin}/"}
+        {"email": email_clean, "redirectTo": f"{origin}/"},
+        origin=origin,
     )
+    if status == 404:
+        status, data, _ = _neon_request(
+            "request-password-reset",
+            "POST",
+            {"email": email_clean, "redirectTo": f"{origin}/"},
+            origin=origin,
+        )
     if status not in (200, 204):
         err_msg = data.get("message") if isinstance(data, dict) else "Failed to send reset link"
         return JSONResponse(status_code=status if status in (400, 429) else 500,
@@ -253,14 +312,16 @@ def api_auth_request_reset(payload: RequestResetIn, request: Request):
 
 
 @app.post("/api/auth/reset-password")
-def api_auth_reset_password(payload: ResetPasswordIn, response: Response):
+def api_auth_reset_password(payload: ResetPasswordIn, request: Request, response: Response):
     """Complete a password reset with token."""
     if not AUTH_ENABLED:
         return JSONResponse(status_code=503, content={"ok": False, "error": "Authentication is not configured"})
+    origin = _get_request_origin(request)
     status, data, set_cookie = _neon_request(
         "reset-password",
         "POST",
-        {"token": payload.token.strip(), "newPassword": payload.new_password}
+        {"token": payload.token.strip(), "newPassword": payload.new_password},
+        origin=origin,
     )
     if status != 200:
         err_msg = data.get("message") if isinstance(data, dict) else "Password reset failed"
@@ -275,7 +336,7 @@ def api_auth_reset_password(payload: ResetPasswordIn, response: Response):
 
 
 @app.post("/api/auth/signup")
-def api_auth_signup(payload: SignUpIn, response: Response):
+def api_auth_signup(payload: SignUpIn, request: Request, response: Response):
     """Set up initial password / account for invited team members."""
     if not AUTH_ENABLED:
         return JSONResponse(status_code=503, content={"ok": False, "error": "Authentication is not configured"})
@@ -283,10 +344,12 @@ def api_auth_signup(payload: SignUpIn, response: Response):
     if INVITED_EMAILS and email_clean not in INVITED_EMAILS:
         return JSONResponse(status_code=403, content={"ok": False, "error": "Registration is invitation-only. Contact your admin."})
     name = (payload.name or email_clean.split("@")[0]).strip()
+    origin = _get_request_origin(request)
     status, data, set_cookie = _neon_request(
         "sign-up/email",
         "POST",
-        {"email": email_clean, "password": payload.password, "name": name}
+        {"email": email_clean, "password": payload.password, "name": name, "callbackURL": f"{origin}/"},
+        origin=origin,
     )
     if status != 200:
         err_msg = data.get("message") if isinstance(data, dict) else "Signup failed"
@@ -305,7 +368,8 @@ def api_auth_signup(payload: SignUpIn, response: Response):
 def api_auth_logout(request: Request, response: Response):
     token = _session_from_request(request)
     if token:
-        _neon_request("sign-out", "POST", session_token=token)
+        origin = _get_request_origin(request)
+        _neon_request("sign-out", "POST", body={}, session_token=token, origin=origin)
     response.delete_cookie(AUTH_COOKIE, path="/")
     return {"ok": True}
 
