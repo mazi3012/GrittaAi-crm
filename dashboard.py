@@ -174,11 +174,68 @@ def _session_from_request(request: Request):
     return request.cookies.get(AUTH_COOKIE)
 
 
+def _valid_session_db(session_token):
+    """Validate session directly against the neon_auth schema in the database.
+
+    This is the primary validation path — it avoids the Neon Auth HTTP API
+    which may return ``null`` for otherwise valid sessions.
+    """
+    try:
+        from db import _connect, USE_PG
+        if not USE_PG:
+            return None
+        conn = _connect()
+        try:
+            cur = conn.execute(
+                'SELECT s."id", s."userId", s."expiresAt", '
+                '       u."id", u."name", u."email", u."image", u."role" '
+                'FROM neon_auth.session s '
+                'JOIN neon_auth."user" u ON u."id" = s."userId" '
+                'WHERE s."token" = %s '
+                'LIMIT 1',
+                (str(session_token).strip(),),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            (sid, s_uid, expires_at, uid, uname, uemail, uimage, urole) = row
+            # -- check expiry (expiresAt is timezone-aware from Neon) --
+            import datetime, zoneinfo
+            now = datetime.datetime.now(tz=zoneinfo.ZoneInfo("GMT"))
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=zoneinfo.ZoneInfo("GMT"))
+            if now > expires_at:
+                return None
+            # -- invited-emails guard --
+            email_lower = str(uemail or "").strip().lower()
+            if INVITED_EMAILS and email_lower not in INVITED_EMAILS:
+                return None
+            return {
+                "session": {"id": str(sid), "userId": str(s_uid), "token": session_token},
+                "user": {
+                    "id": str(uid),
+                    "name": uname or "",
+                    "email": uemail or "",
+                    "image": uimage,
+                    "role": urole or "user",
+                },
+            }
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
 def _valid_session(session_token, origin: Optional[str] = None):
     if not AUTH_ENABLED or not session_token:
         return None
+    # ---- primary: direct DB lookup (fast, reliable) ----
+    result = _valid_session_db(session_token)
+    if result:
+        return result
+    # ---- fallback: Neon Auth HTTP API ----
     status, data, _ = _neon_request("get-session", session_token=session_token, origin=origin)
-    if status != 200:
+    if status != 200 or not isinstance(data, dict):
         return None
     session = data.get("session") or data.get("data", {}).get("session")
     user = data.get("user") or data.get("data", {}).get("user")
