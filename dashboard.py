@@ -49,21 +49,87 @@ from starlette.concurrency import run_in_threadpool
 
 load_dotenv()
 
-from db import (  # noqa: E402
-    CLOSING_CALL_STATUSES,
-    STATUSES,
-    YESNO,
-    all_bot_users,
-    all_leads,
-    dashboard_stats,
-    delete_lead,
-    get_lead,
-    init_db,
-    normalize_username,
-    set_bot_user_authorized,
-    today_str,
-    update_lead,
-)
+# Import from original db module (with fallback for missing deps)
+try:
+    from db import (  # noqa: E402
+        CLOSING_CALL_STATUSES,
+        STATUSES,
+        YESNO,
+        all_bot_users as _all_bot_users,
+        all_leads as _all_leads,
+        dashboard_stats as _dashboard_stats,
+        delete_lead as _delete_lead,
+        get_lead as _get_lead,
+        init_db,
+        normalize_username,
+        set_bot_user_authorized as _set_bot_user_authorized,
+        today_str,
+        update_lead as _update_lead,
+    )
+    DB_FALLBACK = False
+except ImportError as e:
+    # Provide dummy values if db.py can't be imported
+    CLOSING_CALL_STATUSES = ()
+    STATUSES = ()
+    YESNO = ("Yes", "No")
+    _all_bot_users = lambda: []
+    _all_leads = lambda: []
+    _dashboard_stats = lambda: {}
+    _delete_lead = lambda x: False
+    _get_lead = lambda x: None
+    init_db = lambda: None
+    normalize_username = lambda x: x
+    _set_bot_user_authorized = lambda x, y: False
+    today_str = lambda: ""
+    _update_lead = lambda x, **y: None
+    DB_FALLBACK = True
+
+# Import optimized modules (with fallback to original)
+try:
+    from db_ops import (
+        get_all_bot_users,
+        get_all_leads_cached,
+        dashboard_stats,
+        delete_lead,
+        get_lead,
+        set_bot_user_authorized,
+        update_lead,
+    )
+    # Use cached versions
+    all_leads = get_all_leads_cached
+    all_bot_users = get_all_bot_users
+except ImportError:
+    # Fallback to original
+    all_bot_users = _all_bot_users
+    all_leads = _all_leads
+    dashboard_stats = _dashboard_stats
+    delete_lead = _delete_lead
+    get_lead = _get_lead
+    set_bot_user_authorized = _set_bot_user_authorized
+    update_lead = _update_lead
+
+# Import security and performance modules
+try:
+    from security import SecurityHeadersMiddleware, validate_origin, sanitize_input
+    from rate_limiter import RateLimiter
+    
+    # Add security headers middleware
+    app.add_middleware(SecurityHeadersMiddleware)
+    
+    # Initialize rate limiter
+    rate_limiter = RateLimiter(max_requests=10, window_seconds=60)
+    HAS_SECURITY = True
+except ImportError:
+    HAS_SECURITY = False
+    rate_limiter = None
+
+# Import logging
+try:
+    from logger import get_logger
+    log = get_logger(__name__)
+except ImportError:
+    import logging
+    log = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -314,6 +380,15 @@ async def api_auth_status(request: Request):
 @app.post("/api/auth/login")
 def api_auth_login(payload: LoginIn, request: Request, response: Response):
     """Proxy email/password login to Neon Auth without exposing its cookie domain."""
+    # Apply rate limiting
+    if rate_limiter:
+        client_ip = request.client.host if request.client else "unknown"
+        if not rate_limiter.is_allowed(client_ip):
+            return JSONResponse(
+                status_code=429,
+                content={"ok": False, "error": "Too many login attempts. Please try again later."}
+            )
+    
     if not AUTH_ENABLED:
         return JSONResponse(status_code=503, content={"ok": False, "error": "Authentication is not configured"})
     email_clean = payload.email.strip().lower()
@@ -501,8 +576,13 @@ def api_add_note(payload: NoteIn):
     lead = get_lead(uname)
     if lead is None:
         return JSONResponse(status_code=404, content={"ok": False, "error": "Lead not found"})
-    merged = f"{lead['note']} | {payload.note.strip()}" if lead["note"] \
-        else payload.note.strip()
+    
+    # Sanitize input to prevent XSS
+    note_text = payload.note.strip()
+    if HAS_SECURITY and 'sanitize_input' in dir():
+        note_text = sanitize_input(note_text, max_length=4000)
+    
+    merged = f"{lead['note']} | {note_text}" if lead["note"] else note_text
     update_lead(uname, note=merged[:4000])
     return {"ok": True}
 
