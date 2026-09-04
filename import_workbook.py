@@ -4,8 +4,10 @@ Usage:
     python import_workbook.py "/absolute/path/to/CRM - Instagram Data(1).xlsx"
     python import_workbook.py "/absolute/path/to/file.xlsx" --dry-run
 
-Only setter tabs containing the 27-column lead header are imported. Tracker
-and Closer are derived/reporting tabs and are intentionally skipped.
+Only setter tabs containing a recognizable lead header are imported. The
+workbook has evolved over time, so setter tabs may have slightly different
+column orders and optional columns. Tracker and Closer are derived/reporting
+tabs and are intentionally skipped.
 """
 
 from __future__ import annotations
@@ -31,7 +33,6 @@ REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 NS = {"m": MAIN_NS, "r": REL_NS}
 
-EXPECTED_HEADERS = tuple(HEADER_TO_FIELD)
 SKIP_TABS = {"Tracker", "Closer", "Sync Log"}
 DATE_FIELDS = {
     "first_touchpoint", "last_touchpoint", "next_touchpoint",
@@ -41,6 +42,17 @@ DATE_FIELDS = {
 YESNO_FIELDS = {
     "replied", "number_received", "follow_up_1", "follow_up_2",
     "follow_up_3", "follow_up_4", "discovery_call",
+}
+
+# Header spellings used by older exports. Header matching is case-insensitive
+# and ignores trailing/leading whitespace, but these aliases also account for
+# columns that were renamed or split in the real workbook.
+HEADER_ALIASES = {
+    "profile link": "Profile Link",
+    "number": "Number",
+    "email received": None,  # informational flag; the DB stores the address
+    "email": "Email",
+    "last touchpoint (date)": "Last Touchpoint (Date)",
 }
 
 # These are the canonical names already used by the CRM/dashboard.
@@ -154,6 +166,15 @@ def _setter_name(value, tab_name):
     return CANONICAL_SETTERS.get(raw.casefold(), raw)
 
 
+def _field_for_header(header):
+    """Resolve a workbook header to a DB field, tolerating export variants."""
+    normalized = str(header or "").strip()
+    if not normalized:
+        return None
+    canonical = HEADER_ALIASES.get(normalized.casefold(), normalized)
+    return HEADER_TO_FIELD.get(canonical)
+
+
 def load_workbook(path):
     """Return (lead dictionaries, import metadata) from an .xlsx workbook."""
     leads = []
@@ -163,18 +184,29 @@ def load_workbook(path):
         shared = _shared_strings(zf)
         for tab_name, target in _sheet_targets(zf):
             rows = _read_rows(zf, target, shared)
-            headers = [_column_name(i) for i in range(len(EXPECTED_HEADERS))]
-            headers = [rows[0].get(column, "").strip() for column in headers] if rows else []
-            if tab_name in SKIP_TABS or tuple(headers) != EXPECTED_HEADERS:
+            if not rows or tab_name in SKIP_TABS:
+                metadata["skipped"][tab_name] = "derived/non-lead tab"
+                continue
+            header_columns = {
+                column: str(value or "").strip()
+                for column, value in rows[0].items()
+                if str(value or "").strip()
+            }
+            fields_by_column = {
+                column: _field_for_header(header)
+                for column, header in header_columns.items()
+            }
+            # A setter tab must have a username column. This excludes report
+            # tabs while allowing optional columns and different column order.
+            if "user_name" not in fields_by_column.values():
                 metadata["skipped"][tab_name] = "derived/non-lead tab"
                 continue
             metadata["tabs"].append(tab_name)
-            fields = [HEADER_TO_FIELD.get(header) for header in headers]
             for raw in rows[1:]:
                 lead = {}
-                for index, field in enumerate(fields):
+                for column, field in fields_by_column.items():
                     if field:
-                        value = raw.get(_column_name(index), "")
+                        value = raw.get(column, "")
                         if field in DATE_FIELDS:
                             value = _excel_date(value)
                         elif field in YESNO_FIELDS:
@@ -237,7 +269,13 @@ def import_leads(leads, reset=False):
                 data.setdefault("status", "Message Sent")
                 data.setdefault("first_touchpoint", db.today_str())
                 data.setdefault("last_touchpoint", db.today_str())
-                values.append(tuple(data.get(column) or "" for column in columns))
+                # Postgres has an INTEGER lead_number column; unlike text
+                # fields, an empty workbook cell must not be converted to "".
+                values.append(tuple(
+                    (data.get(column) if column == "lead_number"
+                     else data.get(column) or "")
+                    for column in columns
+                ))
             with conn.cursor() as cursor:
                 cursor.executemany(statement, values)
             conn.commit()

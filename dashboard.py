@@ -34,6 +34,7 @@ Run with either:
 import json
 import os
 import time
+from typing import Optional
 import urllib.error
 import urllib.request
 from http.cookies import SimpleCookie
@@ -58,6 +59,7 @@ from db import (  # noqa: E402
     get_lead,
     init_db,
     normalize_username,
+    set_bot_user_authorized,
     today_str,
     update_lead,
 )
