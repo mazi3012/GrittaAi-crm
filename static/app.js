@@ -1,5 +1,5 @@
 /* ============================================================
-   Gretta CRM — app.js
+   Gritta CRM — app.js
    Vanilla JS SPA · mirrors the team Google Sheet columns
    (Lead Number … Closed Won/Lost) · polls FastAPI · no build step
    ============================================================ */

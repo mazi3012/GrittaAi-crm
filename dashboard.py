@@ -65,7 +65,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 MAX_TEXT = 4000  # sanity cap for note payloads
-app = FastAPI(title="Gretta CRM")
+app = FastAPI(title="Gritta CRM")
 
 # --------------------------------------------------------------------- auth
 # Set ADMIN_PASSWORD in the environment (local .env or Vercel/Render env vars)
