@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Gretta logo</title>
+  <desc id="desc">A teal and blue circular mark surrounding a dark heartbeat key symbol.</desc>
+  <defs>
+    <linearGradient id="outer" x1="24" y1="24" x2="232" y2="232" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#dff5f7"/>
+      <stop offset=".52" stop-color="#8bc8e8"/>
+      <stop offset="1" stop-color="#1679c4"/>
+    </linearGradient>
+    <linearGradient id="inner" x1="61" y1="69" x2="194" y2="190" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2ac8bd"/>
+      <stop offset="1" stop-color="#06999f"/>
+    </linearGradient>
+  </defs>
+  <circle cx="128" cy="128" r="91" fill="none" stroke="url(#outer)" stroke-width="16"/>
+  <path d="M171 87a53 53 0 1 0 1 82" fill="none" stroke="url(#inner)" stroke-width="17" stroke-linecap="round"/>
+  <path d="M79 128h24l12-21 13 42 14-21h43" fill="none" stroke="#14213d" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M167 128h18v16h-18z" fill="#14213d"/>
+  <circle cx="190" cy="128" r="16" fill="#ffb51b"/>
+  <circle cx="190" cy="128" r="7" fill="#fff"/>
+</svg>

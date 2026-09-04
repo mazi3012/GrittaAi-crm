@@ -856,6 +856,9 @@ function applyTheme(mode) {
   document.documentElement.dataset.theme = mode;
   localStorage.setItem("gretta-theme", mode);
   $("themeBtn").textContent = mode === "light" ? "🌙" : "☀️";
+  document.querySelectorAll("[data-light-logo][data-dark-logo]").forEach((logo) => {
+    logo.src = mode === "light" ? logo.dataset.lightLogo : logo.dataset.darkLogo;
+  });
 }
 function toggleTheme() {
   applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
