@@ -803,42 +803,77 @@ function hideLogin() {
   if (g) g.style.display = "none";
 }
 
-function switchAuthTab(tabName) {
-  const tabs = document.querySelectorAll(".auth-tab");
+function setAuthAlert(msg, type = "error") {
+  const el = $("authAlert");
+  if (!el) return;
+  if (!msg) {
+    el.style.display = "none";
+    el.className = "auth-alert";
+    el.innerHTML = "";
+    return;
+  }
+  const icons = {
+    error: "⚠️",
+    success: "✅",
+    info: "ℹ️"
+  };
+  const icon = icons[type] || "ℹ️";
+  el.className = `auth-alert ${type}`;
+  el.innerHTML = `<span>${icon}</span><span style="flex:1;">${esc(msg)}</span>`;
+  el.style.display = "flex";
+}
+
+function switchAuthTab(tabName = "signin") {
+  const tabs = document.querySelectorAll(".auth-tab-btn");
   tabs.forEach(t => {
     t.classList.toggle("active", t.dataset.authTab === tabName);
   });
-  
-  const forms = ["signin", "setup", "reset"];
-  forms.forEach(name => {
-    const el = $(`auth-panel-${name}`);
-    if (el) el.style.display = (name === tabName) ? "block" : "none";
+
+  const panels = document.querySelectorAll(".auth-form-panel");
+  panels.forEach(p => {
+    p.classList.toggle("active", p.dataset.panel === tabName);
   });
 
-  setAuthFeedback("", "none");
+  if (tabName === "reset") {
+    const reqForm = $("resetRequestForm");
+    const confForm = $("resetConfirmForm");
+    if (reqForm && confForm && !($("resetToken") && $("resetToken").value.trim())) {
+      reqForm.classList.add("active");
+      confForm.classList.remove("active");
+    }
+  }
+
+  setAuthAlert("");
 }
 
-function setAuthFeedback(msg, type = "err", panelId = null) {
-  const feedbackEls = document.querySelectorAll(".auth-feedback");
-  feedbackEls.forEach(el => {
-    if (!panelId || el.id === panelId) {
-      el.className = `auth-feedback ${type}`;
-      el.textContent = msg;
-      el.style.display = msg ? "block" : "none";
+function setBtnLoading(btn, loading, defaultText = "Submit") {
+  if (!btn) return;
+  const spinner = btn.querySelector(".btn-spinner");
+  const text = btn.querySelector(".btn-text");
+  btn.disabled = loading;
+  if (spinner) spinner.style.display = loading ? "inline-block" : "none";
+  if (text) {
+    if (loading) {
+      btn.dataset.origText = text.textContent;
+      text.textContent = "Please wait…";
+    } else {
+      text.textContent = btn.dataset.origText || defaultText;
     }
-  });
+  }
 }
 
 function updateSidebarUser(user) {
   CURRENT_USER = user;
   const userProfile = $("sidebarUserProfile");
+  const userName = $("sidebarUserName");
   const userEmail = $("sidebarUserEmail");
   const userAvatar = $("sidebarUserAvatar");
   const logoutBtn = $("logoutBtn");
 
   if (user && user.email) {
     if (userProfile) userProfile.style.display = "flex";
-    if (userEmail) userEmail.textContent = user.name || user.email;
+    if (userName) userName.textContent = user.name || (user.email.split("@")[0]);
+    if (userEmail) userEmail.textContent = user.email;
     if (userAvatar) {
       userAvatar.textContent = initials(user.name || user.email);
       userAvatar.style.background = avColor(user.email);
@@ -866,13 +901,13 @@ async function initAuth() {
 
     if (resetToken) {
       showLogin("reset");
-      const tokenInput = $("resetTokenInput");
+      const tokenInput = $("resetToken");
       if (tokenInput) tokenInput.value = resetToken;
-      const step2 = $("resetStep2");
-      if (step2) step2.style.display = "block";
-      const step1 = $("resetStep1");
-      if (step1) step1.style.display = "none";
-      setAuthFeedback("Reset token detected from email link. Enter your new password below.", "success");
+      const reqForm = $("resetRequestForm");
+      const confForm = $("resetConfirmForm");
+      if (reqForm) reqForm.classList.remove("active");
+      if (confForm) confForm.classList.add("active");
+      setAuthAlert("Reset token loaded from verification link. Enter a new password below.", "info");
       return false;
     }
 
@@ -885,32 +920,230 @@ async function initAuth() {
   } catch (e) {
     if (resetToken) {
       showLogin("reset");
-      const tokenInput = $("resetTokenInput");
+      const tokenInput = $("resetToken");
       if (tokenInput) tokenInput.value = resetToken;
-      const step2 = $("resetStep2");
-      if (step2) step2.style.display = "block";
-      const step1 = $("resetStep1");
-      if (step1) step1.style.display = "none";
+      const reqForm = $("resetRequestForm");
+      const confForm = $("resetConfirmForm");
+      if (reqForm) reqForm.classList.remove("active");
+      if (confForm) confForm.classList.add("active");
+      setAuthAlert("Reset token loaded. Enter your new password below.", "info");
       return false;
     }
     showLogin("signin");
     return false;
   }
 }
+function wireAuthControls() {
+  document.querySelectorAll(".auth-tab-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      switchAuthTab(btn.dataset.authTab);
+    });
+  });
+
+  document.querySelectorAll("[data-switch-tab]").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      switchAuthTab(btn.dataset.switchTab);
+    });
+  });
+
+  document.querySelectorAll(".auth-eye-btn").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      const target = $(btn.dataset.toggleTarget);
+      if (!target) return;
+      if (target.type === "password") {
+        target.type = "text";
+        btn.textContent = "🙈";
+      } else {
+        target.type = "password";
+        btn.textContent = "👁";
+      }
+    });
+  });
+
+  const showTokenDirectBtn = $("showTokenDirectBtn");
+  if (showTokenDirectBtn) {
+    showTokenDirectBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      const reqForm = $("resetRequestForm");
+      const confForm = $("resetConfirmForm");
+      if (reqForm) reqForm.classList.remove("active");
+      if (confForm) confForm.classList.add("active");
+      setAuthAlert("");
+    });
+  }
+
+  const backToRequestBtn = $("backToRequestBtn");
+  if (backToRequestBtn) {
+    backToRequestBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      const reqForm = $("resetRequestForm");
+      const confForm = $("resetConfirmForm");
+      if (confForm) confForm.classList.remove("active");
+      if (reqForm) reqForm.classList.add("active");
+      setAuthAlert("");
+    });
+  }
+}
+
 function wireLogin() {
-  $("loginForm").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    $("loginErr").textContent = "";
-    try {
-      await api("/api/auth/login", { method: "POST",
-        body: { email: $("loginUser").value, password: $("loginPass").value } });
-      hideLogin(); await load();
-    } catch (err) { $("loginErr").textContent = err.message; }
-  });
-  $("logoutBtn").addEventListener("click", async () => {
-    try { await api("/api/auth/logout", { method: "POST" }); } catch {}
-    LEADS = []; STATS = {}; render(); showLogin();
-  });
+  wireAuthControls();
+
+  const loginForm = $("loginForm");
+  if (loginForm) {
+    loginForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      setAuthAlert("");
+      const submitBtn = $("loginSubmitBtn");
+      const email = ($("loginUser") ? $("loginUser").value : "").trim();
+      const password = $("loginPass") ? $("loginPass").value : "";
+
+      if (!email || !password) {
+        setAuthAlert("Please enter both your work email and password.", "error");
+        return;
+      }
+
+      setBtnLoading(submitBtn, true);
+      try {
+        const res = await api("/api/auth/login", {
+          method: "POST",
+          body: { email, password }
+        });
+        if (res.user) updateSidebarUser(res.user);
+        hideLogin();
+        toast("Signed in successfully!", "ok");
+        await load();
+      } catch (err) {
+        setAuthAlert(err.message || "Failed to sign in. Please verify your credentials.", "error");
+      } finally {
+        setBtnLoading(submitBtn, false, "🔐 Sign In");
+      }
+    });
+  }
+
+  const resetRequestForm = $("resetRequestForm");
+  if (resetRequestForm) {
+    resetRequestForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      setAuthAlert("");
+      const submitBtn = $("resetRequestBtn");
+      const email = ($("resetEmail") ? $("resetEmail").value : "").trim();
+
+      if (!email) {
+        setAuthAlert("Please enter your registered work email.", "error");
+        return;
+      }
+
+      setBtnLoading(submitBtn, true);
+      try {
+        const res = await api("/api/auth/request-reset", {
+          method: "POST",
+          body: { email }
+        });
+        setAuthAlert(res.message || "Reset link dispatched! Enter the token below if received.", "success");
+        const reqForm = $("resetRequestForm");
+        const confForm = $("resetConfirmForm");
+        if (reqForm) reqForm.classList.remove("active");
+        if (confForm) confForm.classList.add("active");
+      } catch (err) {
+        setAuthAlert(err.message || "Unable to send password reset link.", "error");
+      } finally {
+        setBtnLoading(submitBtn, false, "📨 Send Reset Link");
+      }
+    });
+  }
+
+  const resetConfirmForm = $("resetConfirmForm");
+  if (resetConfirmForm) {
+    resetConfirmForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      setAuthAlert("");
+      const submitBtn = $("resetConfirmBtn");
+      const token = ($("resetToken") ? $("resetToken").value : "").trim();
+      const new_password = $("resetNewPass") ? $("resetNewPass").value : "";
+
+      if (!token) {
+        setAuthAlert("Please paste the reset token from your email link.", "error");
+        return;
+      }
+      if (new_password.length < 8) {
+        setAuthAlert("New password must be at least 8 characters.", "error");
+        return;
+      }
+
+      setBtnLoading(submitBtn, true);
+      try {
+        const res = await api("/api/auth/reset-password", {
+          method: "POST",
+          body: { token, new_password }
+        });
+        if (res.user) {
+          updateSidebarUser(res.user);
+          hideLogin();
+          toast("Password updated! Welcome back.", "ok");
+          await load();
+        } else {
+          setAuthAlert("Password updated successfully! Please sign in with your new password.", "success");
+          setTimeout(() => switchAuthTab("signin"), 1400);
+        }
+      } catch (err) {
+        setAuthAlert(err.message || "Invalid or expired reset token.", "error");
+      } finally {
+        setBtnLoading(submitBtn, false, "✨ Update Password & Sign In");
+      }
+    });
+  }
+
+  const signupForm = $("signupForm");
+  if (signupForm) {
+    signupForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      setAuthAlert("");
+      const submitBtn = $("signupSubmitBtn");
+      const name = ($("signupName") ? $("signupName").value : "").trim();
+      const email = ($("signupEmail") ? $("signupEmail").value : "").trim();
+      const password = $("signupPass") ? $("signupPass").value : "";
+
+      if (!email || !password) {
+        setAuthAlert("Please enter your work email and choose a password.", "error");
+        return;
+      }
+      if (password.length < 8) {
+        setAuthAlert("Password must be at least 8 characters long.", "error");
+        return;
+      }
+
+      setBtnLoading(submitBtn, true);
+      try {
+        const res = await api("/api/auth/signup", {
+          method: "POST",
+          body: { name, email, password }
+        });
+        if (res.user) updateSidebarUser(res.user);
+        hideLogin();
+        toast("Account activated! Welcome to Gritta CRM.", "ok");
+        await load();
+      } catch (err) {
+        setAuthAlert(err.message || "Registration failed. Contact your administrator.", "error");
+      } finally {
+        setBtnLoading(submitBtn, false, "🚀 Activate & Sign In");
+      }
+    });
+  }
+
+  const logoutBtn = $("logoutBtn");
+  if (logoutBtn) {
+    logoutBtn.addEventListener("click", async () => {
+      try { await api("/api/auth/logout", { method: "POST" }); } catch {}
+      CURRENT_USER = null;
+      updateSidebarUser(null);
+      LEADS = [];
+      STATS = {};
+      render();
+      showLogin("signin");
+    });
+  }
 }
 
 /* ---------- data loading / polling ---------- */

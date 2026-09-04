@@ -125,7 +125,7 @@
     <div id="authAlert" class="auth-alert" style="display:none;"></div>
 
     <!-- 1. SIGN IN FORM -->
-    <form id="loginForm" class="auth-form-panel active" autocomplete="on">
+    <form id="loginForm" class="auth-form-panel active" data-panel="signin" autocomplete="on">
       <div class="auth-field">
         <label class="auth-label" for="loginUser">Work Email</label>
         <div class="auth-input-wrap">
@@ -157,7 +157,7 @@
       </div>
     </form>
     <!-- 2. RESET PASSWORD FORM -->
-    <div id="resetPanel" class="auth-form-panel">
+    <div id="resetPanel" class="auth-form-panel" data-panel="reset">
       <!-- 2A. Request reset link -->
       <form id="resetRequestForm" class="auth-sub-panel active">
         <p class="auth-desc">Enter your work email and we will send you a secure link to reset or set your password.</p>
@@ -212,7 +212,7 @@
     </div>
 
     <!-- 3. ACTIVATE / SIGN UP FORM -->
-    <form id="signupForm" class="auth-form-panel" autocomplete="on">
+    <form id="signupForm" class="auth-form-panel" data-panel="activate" autocomplete="on">
       <p class="auth-desc">Invited team members: set up your profile and password to activate your command center access.</p>
       
       <div class="auth-field">
