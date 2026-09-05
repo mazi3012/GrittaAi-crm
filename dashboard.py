@@ -518,9 +518,35 @@ def _lead_dicts():
 
 
 @app.get("/api/leads")
-def api_leads():
+def api_leads(limit: int = 0, offset: int = 0):
+    """Get leads with optional pagination.
+    
+    Args:
+        limit: Max leads to return (0 = all)
+        offset: Number of leads to skip
+    """
     init_db()
-    return {"leads": _lead_dicts(), "stats": dashboard_stats()}
+    all_leads_data = _lead_dicts()
+    total = len(all_leads_data)
+    
+    # Apply pagination
+    if limit > 0:
+        leads_page = all_leads_data[offset:offset + limit]
+    else:
+        leads_page = all_leads_data
+        offset = 0
+        limit = total
+    
+    return {
+        "leads": leads_page,
+        "stats": dashboard_stats(),
+        "pagination": {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + limit < total
+        }
+    }
 
 
 class StageIn(BaseModel):

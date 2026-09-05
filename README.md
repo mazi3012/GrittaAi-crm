@@ -168,6 +168,49 @@ Basumatary` as the canonical setter name.
 
 ---
 
+## 🔐 Security & Performance Audit
+
+*Last updated: September 2025*
+
+### Security Status
+
+| Area | Status | Notes |
+|------|--------|-------|
+| Environment Variables | ✅ Good | `.env` gitignored, `.env.example` provided |
+| Security Headers | ✅ Good | HSTS, X-Frame-Options, CSP enabled |
+| CSRF Protection | ✅ Good | HMAC-SHA256 tokens with expiry |
+| Rate Limiting | ✅ Good | Sliding window per-IP limits |
+| Input Sanitization | ✅ Good | Control character filtering |
+| SQL Injection | ✅ Good | Parameterized queries throughout |
+| Access Control | ✅ Good | Allowlists for Telegram IDs/usernames |
+
+### Performance Status
+
+| Area | Status | Notes |
+|------|--------|-------|
+| Caching | ✅ Good | Multi-tier LRU cache with TTL |
+| DB Connection Pool | ✅ Good | PostgreSQL pool (max 10) |
+| SQLite Tuning | ✅ Good | WAL mode, optimized pragmas |
+| Query Indexing | ✅ Good | Indexes on common filters |
+| Debounced Sync | ✅ Good | 8s coalesce prevents quota exhaustion |
+
+### Known Improvements
+
+- **Paginated API**: Dashboard `/api/leads` loads all leads; pagination planned
+- **Cache Invalidation**: Sheet sync invalidates cache on write
+- **Request Timeouts**: External AI API calls have 120s timeout
+- **Connection Health**: PostgreSQL connections tested before reuse
+
+### Security Best Practices
+
+1. Never commit `.env` — only `.env.example` belongs in git
+2. Use `ALLOWED_TELEGRAM_IDS` to restrict bot access in production
+3. Set `AUTH_COOKIE_SECURE=true` on HTTPS deployments
+4. Keep `LOG_LEVEL=INFO` in production to avoid info leaks
+5. Use Neon Postgres (`DATABASE_URL`) for production, not SQLite
+
+---
+
 ## 🔒 Pipeline Rules & Access Control
 
 **Lead lifecycle (mirrors the Google Sheet Status column):**

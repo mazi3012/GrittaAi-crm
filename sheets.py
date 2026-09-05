@@ -28,6 +28,9 @@ import os
 import threading
 import time
 from datetime import date, datetime
+import db
+import requests
+import logging
 
 WEBAPP_URL = os.getenv("GOOGLE_SHEET_WEBAPP_URL", "").strip()
 SHEET_SECRET = os.getenv("GOOGLE_SHEET_SECRET", "").strip()
@@ -164,28 +167,6 @@ def _lead_row(lead):
     return [_fmt(lead.get(f), f) for f in HEADER_TO_FIELD.values()]
 
 
-def _tracker_payload(leads):
-    """Per-setter summary written to the sheet's Tracker tab."""
-    import db
-    statuses = list(db.STATUSES)
-    headers = (["Setter"] + statuses
-               + ["Total", "Warm", "Won", "Lost/NI"])
-    stats = db.dashboard_stats()
-    rows = []
-    for name, bucket in stats["setters"].items():
-        rows.append(
-            [name] + [bucket["by_status"].get(st, 0) for st in statuses]
-            + [bucket["total"],
-               sum(bucket["by_status"].get(x, 0) for x in db.CLOSER_STATUSES),
-               bucket["by_status"].get("Won", 0),
-               bucket["by_status"].get("Lost", 0)
-               + bucket["by_status"].get("Not Interested", 0)]
-        )
-    rows.append(["TOTAL"] + [stats["by_status"].get(st, 0) for st in statuses]
-                + [stats["total"], stats["warm"], stats["won"], stats["lost"]])
-    return {"headers": headers, "rows": rows}
-
-
 def push_now():
     """Push the complete CRM snapshot to the sheet right now (blocking).
 
@@ -194,24 +175,72 @@ def push_now():
     if not WEBAPP_URL:
         return False, "GOOGLE_SHEET_WEBAPP_URL is not configured"
     try:
-        import db
         leads = db.all_leads()
-        groups, closer = {}, []
+        headers_list = list(HEADERS)
+        groups = {}
+        closer = []
+        # For tracker: setter -> {status: count}
+        setter_stats = {}
+        # Overall counts
+        overall_counts = {st: 0 for st in db.STATUSES}
+        overall_warm = 0
+        overall_won = 0
+        overall_lost = 0  # Lost + Not Interested
+
         for lead in leads:
             row = _lead_row(lead)
-            groups.setdefault(tab_for(lead["sender_name"]), []).append(row)
+            setter_name = lead["sender_name"]
+            tab = tab_for(setter_name)
+            # Add to groups
+            groups.setdefault(tab, []).append(row)
+            # Update setter stats
+            if setter_name not in setter_stats:
+                setter_stats[setter_name] = {st: 0 for st in db.STATUSES}
+            setter_stats[setter_name][lead["status"]] += 1
+            # Update overall counts
+            overall_counts[lead["status"]] += 1
             if lead["status"] in db.CLOSER_STATUSES:
                 closer.append(row)
-        payload = {
+                overall_warm += 1
+            if lead["status"] == "Won":
+                overall_won += 1
+            if lead["status"] in ("Lost", "Not Interested"):
+                overall_lost += 1
+
+        # Build tracker payload
+        statuses = list(db.STATUSES)
+        tracker_headers = ["Setter"] + statuses + ["Total", "Warm", "Won", "Lost/NI"]
+        tracker_rows = []
+        # Add rows for each setter (sorted by name for deterministic order)
+        for name in sorted(setter_stats.keys()):
+            bucket = setter_stats[name]
+            row = [name] + [bucket.get(st, 0) for st in statuses]
+            total = sum(bucket.values())
+            warm = sum(bucket.get(st, 0) for st in db.CLOSER_STATUSES)
+            won = bucket.get("Won", 0)
+            lost = bucket.get("Lost", 0) + bucket.get("Not Interested", 0)
+            row.extend([total, warm, won, lost])
+            tracker_rows.append(row)
+        # Add TOTAL row
+        total_row = ["TOTAL"] + [overall_counts.get(st, 0) for st in statuses]
+        total_row.extend([
+            sum(overall_counts.values()),
+            overall_warm,
+            overall_won,
+            overall_lost
+        ])
+        tracker_rows.append(total_row)
+        tracker = {"headers": tracker_headers, "rows": tracker_rows}
+
+                payload = {
             "secret": SHEET_SECRET,
             "action": "replace_all",
-            "headers": list(HEADERS),
+            "headers": headers_list,
             "groups": groups,
-            "closer": {"headers": list(HEADERS), "rows": closer},
-            "tracker": _tracker_payload(leads),
+            "closer": {"headers": headers_list, "rows": closer},
+            "tracker": tracker,
             "syncedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
-        import requests  # already a core dependency of this project
 
         # requests follows the Apps Script 302 redirect chain by default,
         # which is exactly how doPost responses arrive.
@@ -228,7 +257,8 @@ def push_now():
             return True, data.get("detail") or f"{len(leads)} leads mirrored"
         return False, str((data or {}).get("error", "unknown Apps Script error"))
     except Exception as exc:
-        return False, str(exc)[:300]
+        logging.exception("Error in push_now")
+        return False, "Internal error during sheet sync"
 
 
 def _parse_date(value):
@@ -267,6 +297,7 @@ def pull_now():
         return False, "GOOGLE_SHEET_WEBAPP_URL is not configured"
     try:
         import db
+        from cache import cache
         import requests
         resp = requests.get(WEBAPP_URL, params={"secret": SHEET_SECRET},
                             timeout=30)
@@ -314,6 +345,8 @@ def pull_now():
                     created += 1
                 else:
                     updated += 1
+        # Invalidate cache after successful pull
+        cache.invalidate_leads()
         return True, (f"imported {created} new + updated {updated} leads "
                       f"from {len([t for t in tabs if t not in _DERIVED_TABS])} tabs")
     except Exception as exc:
