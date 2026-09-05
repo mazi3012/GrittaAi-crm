@@ -232,15 +232,15 @@ def push_now():
         tracker_rows.append(total_row)
         tracker = {"headers": tracker_headers, "rows": tracker_rows}
 
-                payload = {
-            "secret": SHEET_SECRET,
-            "action": "replace_all",
-            "headers": headers_list,
-            "groups": groups,
-            "closer": {"headers": headers_list, "rows": closer},
-            "tracker": tracker,
-            "syncedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
+        payload = {
+    "secret": SHEET_SECRET,
+    "action": "replace_all",
+    "headers": headers_list,
+    "groups": groups,
+    "closer": {"headers": headers_list, "rows": closer},
+    "tracker": tracker,
+    "syncedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+}
 
         # requests follows the Apps Script 302 redirect chain by default,
         # which is exactly how doPost responses arrive.
